@@ -14,6 +14,7 @@
 #include <linux/cred.h>
 #include <linux/sched.h>
 #include <linux/atomic.h>
+#include <linux/sched/task_stack.h>
 
 #include "scth_ioctl.h"
 
@@ -239,18 +240,44 @@ static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
 #ifdef CONFIG_X86_64
     struct pt_regs *sys_regs;
-    u32 nr;
+    u32 nr = 0;
     u32 euid;
     char comm[SCTH_MAX_PROG_LEN];
     bool match = false;
     u64 now_ns;
 
-    /* syscall_trace_enter(struct pt_regs *regs): arg1 in RDI */
-    sys_regs = (struct pt_regs *)regs->di;
-    if (!sys_regs)
-        return 0;
+    /*
+     * Per ABI x86_64:
+     *  arg1 -> RDI
+     *  arg2 -> RSI
+     *
+     * In molte build, x64_sys_call riceve (struct pt_regs *regs, unsigned int nr),
+     * quindi il numero syscall è spesso in RSI. In alternativa lo recuperiamo da orig_ax
+     * del pt_regs passato in RDI (fallback) ma solo se il puntatore è nello stack corrente.
+     */
 
-    nr = (u32)sys_regs->orig_ax;
+    /* Tentativo 1: nr come secondo argomento */
+    nr = (u32)regs->si;
+
+    /* Tentativo 2 (fallback): pt_regs* in RDI e nr = orig_ax */
+    sys_regs = (struct pt_regs *)regs->di;
+    if (sys_regs) {
+        unsigned long sp = (unsigned long)sys_regs;
+        unsigned long base = (unsigned long)task_stack_page(current);
+
+        /* Dereferenzia sys_regs solo se sta nello stack del task corrente */
+        if (sp >= base && sp < base + THREAD_SIZE) {
+            u32 ax = (u32)sys_regs->orig_ax;
+
+            /* Se nr da RSI non è plausibile, usa orig_ax */
+            if (nr > 1024)  /* soglia “sanity” (x86_64 syscall <= ~600) */
+                nr = ax;
+        }
+    }
+
+    /* Se ancora non plausibile, esci presto */
+    if (nr > 4096)
+        return 0;
 
     euid = (u32)from_kuid(&init_user_ns, current_euid());
     get_task_comm(comm, current);
@@ -270,6 +297,7 @@ static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 #endif
     return 0;
 }
+
 
 /* -----------------------------
  * ioctl + device
@@ -532,7 +560,7 @@ static int __init scth_init(void)
 
     /* kprobe */
     memset(&kp, 0, sizeof(kp));
-    kp.symbol_name = "syscall_trace_enter";
+    kp.symbol_name = "x64_sys_call";
     kp.pre_handler = kp_pre_handler;
 
     ret = register_kprobe(&kp);
