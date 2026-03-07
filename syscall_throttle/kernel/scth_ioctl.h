@@ -50,6 +50,10 @@ struct scth_stats {
     __u32 monitor_on;
 };
 
+struct scth_mode_req {
+    __u32 mode;  /* 0=baseline, 1=backoff, 2=atomic_tokens */
+};
+
 #define SCTH_IOC_ADD_PROG      _IOW(SCTH_IOC_MAGIC,  1, struct scth_prog_req)
 #define SCTH_IOC_DEL_PROG      _IOW(SCTH_IOC_MAGIC,  2, struct scth_prog_req)
 #define SCTH_IOC_ADD_UID       _IOW(SCTH_IOC_MAGIC,  3, struct scth_uid_req)
@@ -66,5 +70,9 @@ struct scth_stats {
 #define SCTH_IOC_LIST_SYSCALL  _IOWR(SCTH_IOC_MAGIC, 12, struct scth_list_resp)
 
 #define SCTH_IOC_GET_STATS     _IOR(SCTH_IOC_MAGIC,  13, struct scth_stats)
+
+#define SCTH_IOC_RESET_STATS  _IO(SCTH_IOC_MAGIC, 14)
+
+#define SCTH_IOC_SET_MODE     _IOW(SCTH_IOC_MAGIC, 15, struct scth_mode_req)
 
 #endif

@@ -18,9 +18,21 @@
 
 #include "scth_ioctl.h"
 
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Alessandro Cortese");
-MODULE_DESCRIPTION("LKM - Syscall Throttling System");
+
+/* modalità throttling:
+ * 0 = baseline (lock+busy)
+ * 1 = backoff (deadline + polling raro)
+ * 2 = atomic tokens (fast path lockless + rollover lock)
+ */
+static u32 g_mode = 0;
+
+/* token bucket per MODE 2 */
+static atomic_t g_tokens = ATOMIC_INIT(0);
+/* epoch finestra (in secondi) per rollover) */
+static u64 g_epoch_sec = 0;
+
+module_param(g_mode, uint, 0644);
+MODULE_PARM_DESC(g_mode, "Throttle mode: 0=baseline,1=backoff,2=atomic_tokens");
 
 /* -----------------------------
  * Hash sets: prog / uid / syscall
@@ -144,18 +156,30 @@ static void sample_window_stats_locked(void)
         peak_blocked = b;
 }
 
+/* helper: aggiorna peak delay in modo consistente */
+static void update_peak_delay(const char *comm, u32 euid, u64 delay_ns)
+{
+    unsigned long flags;
+
+    spin_lock_irqsave(&cfg_lock, flags);
+    if (delay_ns > peak_delay_ns) {
+        peak_delay_ns = delay_ns;
+        strncpy(peak_prog, comm, SCTH_MAX_PROG_LEN);
+        peak_uid = euid;
+    }
+    spin_unlock_irqrestore(&cfg_lock, flags);
+}
+
 /*
- * Handler di throttling:
- * - non può dormire (kprobe context), quindi busy-wait fino a finestra successiva
- * - misura delay "nel modulo" come richiesto :contentReference[oaicite:4]{index=4}
+ * MODE 0: baseline (quello che avevi già)
+ * lock + polling frequente (ktime_get_ns ad ogni giro)
  */
-static void throttle_if_needed(const char *comm, u32 euid, u64 now_ns)
+static void throttle_baseline(const char *comm, u32 euid, u64 now_ns)
 {
     u64 local_start = 0;
     bool counted = false;
     u32 local_max;
 
-    /* letture “racy” ok, config protetta da cfg_lock quando cambia */
     if (!READ_ONCE(g_monitor_on))
         return;
 
@@ -173,7 +197,6 @@ static void throttle_if_needed(const char *comm, u32 euid, u64 now_ns)
             win_count = 0;
         }
 
-        /* ruota finestra se passato 1s */
         if (now_ns - win_start_ns >= NSEC_PER_SEC) {
             sample_window_stats_locked();
             win_start_ns = now_ns;
@@ -190,11 +213,10 @@ static void throttle_if_needed(const char *comm, u32 euid, u64 now_ns)
         if (counted)
             break;
 
-        /* oltre MAX: “blocca” temporaneamente (busy-wait) */
         if (local_start == 0) {
             local_start = now_ns;
             atomic_inc(&blocked_now);
-            /* track peak_blocked a finestre, e anche qui in modo conservativo */
+            /* peak_blocked aggiornato in modo conservativo */
             {
                 u32 b = (u32)atomic_read(&blocked_now);
                 if (b > READ_ONCE(peak_blocked))
@@ -202,32 +224,197 @@ static void throttle_if_needed(const char *comm, u32 euid, u64 now_ns)
             }
         }
 
-        /* ricontrolla ON/OFF: se spengo il monitor, deve lasciar passare :contentReference[oaicite:5]{index=5} */
         if (!READ_ONCE(g_monitor_on))
             break;
 
         cpu_relax();
         now_ns = ktime_get_ns();
-
-        /* se la finestra è cambiata, al prossimo loop passerà */
-        if (win_start_ns && (now_ns - win_start_ns) >= NSEC_PER_SEC)
-            continue;
     }
 
     if (local_start) {
-        u64 d = now_ns - local_start;
+        atomic_dec(&blocked_now);
+        update_peak_delay(comm, euid, now_ns - local_start);
+    }
+}
+
+/*
+ * MODE 1: backoff progressivo
+ * - calcola deadline della finestra una volta
+ * - riduce i ktime_get_ns (polling raro con step crescente)
+ */
+static void throttle_backoff(const char *comm, u32 euid, u64 now_ns)
+{
+    u64 local_start = 0;
+    bool counted = false;
+    u32 local_max;
+    u64 deadline_ns = 0;
+
+    if (!READ_ONCE(g_monitor_on))
+        return;
+
+    local_max = READ_ONCE(g_max_per_sec);
+    if (local_max == 0)
+        local_max = 1;
+
+    for (;;) {
         unsigned long flags;
 
-        atomic_dec(&blocked_now);
-
         spin_lock_irqsave(&cfg_lock, flags);
-        if (d > peak_delay_ns) {
-            peak_delay_ns = d;
-            strncpy(peak_prog, comm, SCTH_MAX_PROG_LEN);
-            peak_uid = euid;
+
+        if (win_start_ns == 0) {
+            win_start_ns = now_ns;
+            win_count = 0;
+        }
+
+        if (now_ns - win_start_ns >= NSEC_PER_SEC) {
+            sample_window_stats_locked();
+            win_start_ns = now_ns;
+            win_count = 0;
+        }
+
+        if (win_count < local_max) {
+            win_count++;
+            counted = true;
+        } else {
+            if (!deadline_ns)
+                deadline_ns = win_start_ns + NSEC_PER_SEC;
+        }
+
+        spin_unlock_irqrestore(&cfg_lock, flags);
+
+        if (counted)
+            break;
+
+        if (local_start == 0) {
+            local_start = now_ns;
+            atomic_inc(&blocked_now);
+        }
+
+        if (!READ_ONCE(g_monitor_on))
+            break;
+
+        /* backoff: polling raro */
+        {
+            unsigned int step = 64;
+            while (1) {
+                unsigned int i;
+                for (i = 0; i < step; i++)
+                    cpu_relax();
+
+                now_ns = ktime_get_ns();
+                if (now_ns >= deadline_ns)
+                    break;
+
+                if (step < 8192)
+                    step <<= 1;
+            }
+        }
+
+        /* resetta deadline: al prossimo giro verrà ricalcolata sotto lock */
+        deadline_ns = 0;
+    }
+
+    if (local_start) {
+        atomic_dec(&blocked_now);
+        update_peak_delay(comm, euid, now_ns - local_start);
+    }
+}
+
+/*
+ * MODE 2: atomic tokens
+ * - fast path senza lock: atomic_dec_if_positive(&g_tokens)
+ * - lock solo quando cambia secondo (rollover)
+ * - attesa con backoff fino al prossimo secondo
+ */
+static void throttle_atomic_tokens(const char *comm, u32 euid, u64 now_ns)
+{
+    u64 local_start = 0;
+    u32 local_max;
+    u64 now_sec;
+    u64 deadline_ns;
+
+    if (!READ_ONCE(g_monitor_on))
+        return;
+
+    local_max = READ_ONCE(g_max_per_sec);
+    if (local_max == 0)
+        local_max = 1;
+
+    now_sec = now_ns / NSEC_PER_SEC;
+
+    /* rollover: se cambia secondo, reset token */
+    if (READ_ONCE(g_epoch_sec) != now_sec) {
+        unsigned long flags;
+        spin_lock_irqsave(&cfg_lock, flags);
+        if (g_epoch_sec != now_sec) {
+            sample_window_stats_locked();
+            g_epoch_sec = now_sec;
+            atomic_set(&g_tokens, (int)local_max);
         }
         spin_unlock_irqrestore(&cfg_lock, flags);
     }
+
+    /* Fast path: consuma token */
+    if (atomic_dec_if_positive(&g_tokens) >= 0)
+        return;
+
+    /* oltre MAX: aspetta fino al prossimo secondo */
+    local_start = now_ns;
+    atomic_inc(&blocked_now);
+
+    deadline_ns = (now_sec + 1) * NSEC_PER_SEC;
+
+    while (READ_ONCE(g_monitor_on)) {
+        unsigned int step = 64;
+
+        while (1) {
+            unsigned int i;
+            for (i = 0; i < step; i++)
+                cpu_relax();
+
+            now_ns = ktime_get_ns();
+            if (now_ns >= deadline_ns)
+                break;
+
+            if (step < 8192)
+                step <<= 1;
+        }
+
+        now_sec = now_ns / NSEC_PER_SEC;
+
+        /* rollover */
+        if (READ_ONCE(g_epoch_sec) != now_sec) {
+            unsigned long flags;
+            spin_lock_irqsave(&cfg_lock, flags);
+            if (g_epoch_sec != now_sec) {
+                sample_window_stats_locked();
+                g_epoch_sec = now_sec;
+                atomic_set(&g_tokens, (int)local_max);
+            }
+            spin_unlock_irqrestore(&cfg_lock, flags);
+        }
+
+        if (atomic_dec_if_positive(&g_tokens) >= 0)
+            break;
+
+        deadline_ns = (now_sec + 1) * NSEC_PER_SEC;
+    }
+
+    atomic_dec(&blocked_now);
+    update_peak_delay(comm, euid, now_ns - local_start);
+}
+
+/* Wrapper: sceglie modalità */
+static void throttle_if_needed(const char *comm, u32 euid, u64 now_ns)
+{
+    u32 mode = READ_ONCE(g_mode);
+
+    if (mode == 2)
+        throttle_atomic_tokens(comm, euid, now_ns);
+    else if (mode == 1)
+        throttle_backoff(comm, euid, now_ns);
+    else
+        throttle_baseline(comm, euid, now_ns);
 }
 
 /* -----------------------------
@@ -320,6 +507,8 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
     case SCTH_IOC_SET_MAX:
     case SCTH_IOC_MON_ON:
     case SCTH_IOC_MON_OFF:
+    case SCTH_IOC_RESET_STATS:
+    case SCTH_IOC_SET_MODE:
         if (!caller_is_root())
             return -EPERM;
         break;
@@ -497,6 +686,36 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         return 0;
     }
 
+    case SCTH_IOC_RESET_STATS: {
+        peak_delay_ns = 0;
+        memset(peak_prog, 0, sizeof(peak_prog));
+        peak_uid = 0;
+        peak_blocked = 0;
+        sum_blocked = 0;
+        n_windows = 0;
+
+        /* reset finestra */
+        win_start_ns = 0;
+        win_count = 0;
+        atomic_set(&blocked_now, 0);
+
+        /* reset token mode */
+        atomic_set(&g_tokens, 0);
+        g_epoch_sec = 0;
+        break;
+    }
+
+    case SCTH_IOC_SET_MODE: {
+        struct scth_mode_req req;
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
+        if (req.mode > 2) { ret = -EINVAL; break; }
+        g_mode = req.mode;
+        /* reset token state quando cambio mode */
+        atomic_set(&g_tokens, 0);
+        g_epoch_sec = 0;
+        break;
+    }
+
     default:
         ret = -ENOTTY;
         break;
@@ -529,6 +748,7 @@ static void free_hashtable_prog(void)
     int b;
     hash_for_each_safe(prog_ht, b, tmp, e, node) { hash_del(&e->node); kfree(e); }
 }
+
 static void free_hashtable_uid(void)
 {
     struct uid_ent *e;
@@ -536,6 +756,7 @@ static void free_hashtable_uid(void)
     int b;
     hash_for_each_safe(uid_ht, b, tmp, e, node) { hash_del(&e->node); kfree(e); }
 }
+
 static void free_hashtable_sys(void)
 {
     struct sys_ent *e;
@@ -588,3 +809,7 @@ static void __exit scth_exit(void)
 
 module_init(scth_init);
 module_exit(scth_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Alessandro Cortese");
+MODULE_DESCRIPTION("LKM - Syscall Throttling System");

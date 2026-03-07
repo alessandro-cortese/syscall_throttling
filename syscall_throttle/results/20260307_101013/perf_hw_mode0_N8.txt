@@ -1,0 +1,8 @@
+
+ Performance counter stats for process id '6602':
+
+   <not supported>      cycles                                                                
+   <not supported>      instructions                                                          
+
+       5,001226349 seconds time elapsed
+

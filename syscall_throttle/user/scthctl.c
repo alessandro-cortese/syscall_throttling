@@ -139,6 +139,17 @@ static void cmd_stats(int fd)
            st.peak_blocked_threads, st.avg_blocked_threads_x1000 / 1000.0);
 }
 
+static void cmd_resetstats(int fd)
+{
+    if (ioctl(fd, SCTH_IOC_RESET_STATS) < 0) die("ioctl RESET_STATS");
+}
+
+static void cmd_setmode(int fd, uint32_t mode)
+{
+    struct scth_mode_req r = { .mode = mode };
+    if (ioctl(fd, SCTH_IOC_SET_MODE, &r) < 0) die("ioctl SET_MODE");
+}
+
 static void usage(const char *p)
 {
     fprintf(stderr,
@@ -152,8 +163,11 @@ static void usage(const char *p)
         "  %s setmax <max_per_sec>\n"
         "  %s on | off\n"
         "  %s listprog | listuid | listsys\n"
-        "  %s stats\n",
-        p, p, p, p, p, p, p, p, p, p);
+        "  %s stats\n"
+        "  %s resetstats\n"
+        "  %s setmode <0|1|2>\n",
+
+        p, p, p, p, p, p, p, p, p, p, p, p);
     exit(2);
 }
 
@@ -165,19 +179,21 @@ int main(int argc, char **argv)
 
     fd = dev_open();
 
-    if (!strcmp(argv[1], "addprog") && argc == 3) cmd_addprog(fd, argv[2]);
-    else if (!strcmp(argv[1], "delprog") && argc == 3) cmd_delprog(fd, argv[2]);
-    else if (!strcmp(argv[1], "adduid") && argc == 3) cmd_adduid(fd, (uint32_t)strtoul(argv[2], 0, 10));
-    else if (!strcmp(argv[1], "deluid") && argc == 3) cmd_deluid(fd, (uint32_t)strtoul(argv[2], 0, 10));
-    else if (!strcmp(argv[1], "addsys") && argc == 3) cmd_addsys(fd, (uint32_t)strtoul(argv[2], 0, 10));
-    else if (!strcmp(argv[1], "delsys") && argc == 3) cmd_delsys(fd, (uint32_t)strtoul(argv[2], 0, 10));
-    else if (!strcmp(argv[1], "setmax") && argc == 3) cmd_setmax(fd, (uint32_t)strtoul(argv[2], 0, 10));
-    else if (!strcmp(argv[1], "on") && argc == 2) cmd_on(fd);
-    else if (!strcmp(argv[1], "off") && argc == 2) cmd_off(fd);
-    else if (!strcmp(argv[1], "listprog") && argc == 2) cmd_listprog(fd);
-    else if (!strcmp(argv[1], "listuid") && argc == 2) cmd_listuid(fd);
-    else if (!strcmp(argv[1], "listsys") && argc == 2) cmd_listsys(fd);
-    else if (!strcmp(argv[1], "stats") && argc == 2) cmd_stats(fd);
+    if      (!strcmp(argv[1], "addprog")    && argc == 3)       cmd_addprog(fd, argv[2]);
+    else if (!strcmp(argv[1], "delprog")    && argc == 3)       cmd_delprog(fd, argv[2]);
+    else if (!strcmp(argv[1], "adduid")     && argc == 3)       cmd_adduid(fd, (uint32_t)strtoul(argv[2], 0, 10));
+    else if (!strcmp(argv[1], "deluid")     && argc == 3)       cmd_deluid(fd, (uint32_t)strtoul(argv[2], 0, 10));
+    else if (!strcmp(argv[1], "addsys")     && argc == 3)       cmd_addsys(fd, (uint32_t)strtoul(argv[2], 0, 10));
+    else if (!strcmp(argv[1], "delsys")     && argc == 3)       cmd_delsys(fd, (uint32_t)strtoul(argv[2], 0, 10));
+    else if (!strcmp(argv[1], "setmax")     && argc == 3)       cmd_setmax(fd, (uint32_t)strtoul(argv[2], 0, 10));
+    else if (!strcmp(argv[1], "on")         && argc == 2)       cmd_on(fd);
+    else if (!strcmp(argv[1], "off")        && argc == 2)       cmd_off(fd);
+    else if (!strcmp(argv[1], "listprog")   && argc == 2)       cmd_listprog(fd);
+    else if (!strcmp(argv[1], "listuid")    && argc == 2)       cmd_listuid(fd);
+    else if (!strcmp(argv[1], "listsys")    && argc == 2)       cmd_listsys(fd);
+    else if (!strcmp(argv[1], "stats")      && argc == 2)       cmd_stats(fd);
+    else if (!strcmp(argv[1], "resetstats") && argc == 2)       cmd_resetstats(fd);
+    else if (!strcmp(argv[1], "setmode")    && argc == 3)       cmd_setmode(fd, (uint32_t)strtoul(argv[2], 0, 10));
     else usage(argv[0]);
 
     close(fd);

@@ -1,0 +1,3 @@
+monitor_on=1  max_per_sec=5
+peak_delay_ns=1000094849  peak_prog=tester_getpid  peak_uid=1000
+peak_blocked_threads=1  avg_blocked_threads=1.000
