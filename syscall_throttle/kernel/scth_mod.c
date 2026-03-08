@@ -15,6 +15,8 @@
 #include <linux/sched.h>
 #include <linux/atomic.h>
 #include <linux/sched/task_stack.h>
+#include <linux/hrtimer.h>
+#include <linux/timekeeping.h>
 
 #include "scth_ioctl.h"
 
@@ -30,6 +32,9 @@ static u32 g_mode = 0;
 static atomic_t g_tokens = ATOMIC_INIT(0);
 /* epoch finestra (in secondi) per rollover) */
 static u64 g_epoch_sec = 0;
+
+static struct hrtimer epoch_timer;
+static atomic_t epoch_timer_on = ATOMIC_INIT(0);
 
 module_param(g_mode, uint, 0644);
 MODULE_PARM_DESC(g_mode, "Throttle mode: 0=baseline,1=backoff,2=atomic_tokens");
@@ -69,7 +74,8 @@ static DEFINE_SPINLOCK(cfg_lock); /* protegge hash tables + monitor config */
  * ----------------------------- */
 
 /* configurazione */
-static u32 g_max_per_sec = 100;
+static u32 g_max_current = 100;
+static u32 g_max_next = 100;
 static bool g_monitor_on = false;
 
 /* finestra 1s */
@@ -170,6 +176,51 @@ static void update_peak_delay(const char *comm, u32 euid, u64 delay_ns)
     spin_unlock_irqrestore(&cfg_lock, flags);
 }
 
+static inline void apply_deferred_max_locked(void)
+{
+
+    /*Last update wins because g_max_next is overwritten; 
+    deferred because only copied at each epoch boundary*/
+
+    /* chiamare SOLO sotto cfg_lock */
+    if (g_max_current != g_max_next)
+        g_max_current = g_max_next;
+}
+
+/* rollover epoca: chiamare solo sotto cfg_lock */
+static void epoch_rollover_locked(u64 now_ns)
+{
+    /* statistiche finestra */
+    sample_window_stats_locked();
+
+    /* deferred max: diventa attivo dalla prossima epoca */
+    apply_deferred_max_locked();
+
+    /* mode 0/1: reset contatore finestra */
+    win_start_ns = now_ns;
+    win_count = 0;
+
+    /* mode 2: reset token bucket */
+    g_epoch_sec = div_u64(now_ns, NSEC_PER_SEC);
+    atomic_set(&g_tokens, (int)max_t(u32, 1, g_max_current));
+}
+
+/* timer wall-clock: scatta ogni 1s indipendentemente dal traffico */
+static enum hrtimer_restart epoch_timer_cb(struct hrtimer *t)
+{
+    unsigned long flags;
+    u64 now_ns = ktime_get_ns(); /* usiamo monotonic per contatori interni */
+
+    spin_lock_irqsave(&cfg_lock, flags);
+    if (READ_ONCE(g_monitor_on)) {
+        epoch_rollover_locked(now_ns);
+    }
+    spin_unlock_irqrestore(&cfg_lock, flags);
+
+    hrtimer_forward_now(t, ktime_set(1, 0));
+    return HRTIMER_RESTART;
+}
+
 /*
  * MODE 0: baseline (quello che avevi già)
  * lock + polling frequente (ktime_get_ns ad ogni giro)
@@ -179,11 +230,12 @@ static void throttle_baseline(const char *comm, u32 euid, u64 now_ns)
     u64 local_start = 0;
     bool counted = false;
     u32 local_max;
+    u64 epoch_id;
 
     if (!READ_ONCE(g_monitor_on))
         return;
 
-    local_max = READ_ONCE(g_max_per_sec);
+    local_max = READ_ONCE(g_max_current);
     if (local_max == 0)
         local_max = 1;
 
@@ -192,16 +244,8 @@ static void throttle_baseline(const char *comm, u32 euid, u64 now_ns)
 
         spin_lock_irqsave(&cfg_lock, flags);
 
-        if (win_start_ns == 0) {
-            win_start_ns = now_ns;
-            win_count = 0;
-        }
-
-        if (now_ns - win_start_ns >= NSEC_PER_SEC) {
-            sample_window_stats_locked();
-            win_start_ns = now_ns;
-            win_count = 0;
-        }
+        /* epoch_id è win_start_ns aggiornato dal timer */
+        epoch_id = win_start_ns;
 
         if (win_count < local_max) {
             win_count++;
@@ -213,10 +257,11 @@ static void throttle_baseline(const char *comm, u32 euid, u64 now_ns)
         if (counted)
             break;
 
+        /* oltre MAX: blocco fino al cambio epoca */
         if (local_start == 0) {
             local_start = now_ns;
             atomic_inc(&blocked_now);
-            /* peak_blocked aggiornato in modo conservativo */
+            /* peak_blocked conservativo */
             {
                 u32 b = (u32)atomic_read(&blocked_now);
                 if (b > READ_ONCE(peak_blocked))
@@ -227,7 +272,15 @@ static void throttle_baseline(const char *comm, u32 euid, u64 now_ns)
         if (!READ_ONCE(g_monitor_on))
             break;
 
-        cpu_relax();
+        /* attendo cambio epoca: win_start_ns deve cambiare */
+        while (READ_ONCE(g_monitor_on) && READ_ONCE(win_start_ns) == epoch_id) {
+            cpu_relax();
+        }
+
+        /* nuova epoca: aggiorna max locale e riprova */
+        local_max = READ_ONCE(g_max_current);
+        if (local_max == 0)
+            local_max = 1;
         now_ns = ktime_get_ns();
     }
 
@@ -247,12 +300,12 @@ static void throttle_backoff(const char *comm, u32 euid, u64 now_ns)
     u64 local_start = 0;
     bool counted = false;
     u32 local_max;
-    u64 deadline_ns = 0;
+    u64 epoch_id;
 
     if (!READ_ONCE(g_monitor_on))
         return;
 
-    local_max = READ_ONCE(g_max_per_sec);
+    local_max = READ_ONCE(g_max_current);
     if (local_max == 0)
         local_max = 1;
 
@@ -260,26 +313,12 @@ static void throttle_backoff(const char *comm, u32 euid, u64 now_ns)
         unsigned long flags;
 
         spin_lock_irqsave(&cfg_lock, flags);
-
-        if (win_start_ns == 0) {
-            win_start_ns = now_ns;
-            win_count = 0;
-        }
-
-        if (now_ns - win_start_ns >= NSEC_PER_SEC) {
-            sample_window_stats_locked();
-            win_start_ns = now_ns;
-            win_count = 0;
-        }
+        epoch_id = win_start_ns;
 
         if (win_count < local_max) {
             win_count++;
             counted = true;
-        } else {
-            if (!deadline_ns)
-                deadline_ns = win_start_ns + NSEC_PER_SEC;
         }
-
         spin_unlock_irqrestore(&cfg_lock, flags);
 
         if (counted)
@@ -293,25 +332,22 @@ static void throttle_backoff(const char *comm, u32 euid, u64 now_ns)
         if (!READ_ONCE(g_monitor_on))
             break;
 
-        /* backoff: polling raro */
+        /* backoff: relax + check più rado */
         {
             unsigned int step = 64;
-            while (1) {
+            while (READ_ONCE(g_monitor_on) && READ_ONCE(win_start_ns) == epoch_id) {
                 unsigned int i;
                 for (i = 0; i < step; i++)
                     cpu_relax();
-
-                now_ns = ktime_get_ns();
-                if (now_ns >= deadline_ns)
-                    break;
-
                 if (step < 8192)
                     step <<= 1;
             }
         }
 
-        /* resetta deadline: al prossimo giro verrà ricalcolata sotto lock */
-        deadline_ns = 0;
+        local_max = READ_ONCE(g_max_current);
+        if (local_max == 0)
+            local_max = 1;
+        now_ns = ktime_get_ns();
     }
 
     if (local_start) {
@@ -329,75 +365,50 @@ static void throttle_backoff(const char *comm, u32 euid, u64 now_ns)
 static void throttle_atomic_tokens(const char *comm, u32 euid, u64 now_ns)
 {
     u64 local_start = 0;
-    u32 local_max;
-    u64 now_sec;
-    u64 deadline_ns;
+    u64 epoch_sec;
 
     if (!READ_ONCE(g_monitor_on))
         return;
 
-    local_max = READ_ONCE(g_max_per_sec);
-    if (local_max == 0)
-        local_max = 1;
-
-    now_sec = now_ns / NSEC_PER_SEC;
-
-    /* rollover: se cambia secondo, reset token */
-    if (READ_ONCE(g_epoch_sec) != now_sec) {
-        unsigned long flags;
-        spin_lock_irqsave(&cfg_lock, flags);
-        if (g_epoch_sec != now_sec) {
-            sample_window_stats_locked();
-            g_epoch_sec = now_sec;
-            atomic_set(&g_tokens, (int)local_max);
-        }
-        spin_unlock_irqrestore(&cfg_lock, flags);
-    }
-
-    /* Fast path: consuma token */
+    /* Fast path: token */
     if (atomic_dec_if_positive(&g_tokens) >= 0)
         return;
 
-    /* oltre MAX: aspetta fino al prossimo secondo */
     local_start = now_ns;
     atomic_inc(&blocked_now);
 
-    deadline_ns = (now_sec + 1) * NSEC_PER_SEC;
+    epoch_sec = READ_ONCE(g_epoch_sec);
 
-    while (READ_ONCE(g_monitor_on)) {
+    /* attendo cambio epoca: g_epoch_sec viene aggiornato dal timer */
+    {
         unsigned int step = 64;
-
-        while (1) {
+        while (READ_ONCE(g_monitor_on) && READ_ONCE(g_epoch_sec) == epoch_sec) {
             unsigned int i;
             for (i = 0; i < step; i++)
                 cpu_relax();
-
-            now_ns = ktime_get_ns();
-            if (now_ns >= deadline_ns)
-                break;
-
             if (step < 8192)
                 step <<= 1;
         }
+    }
 
-        now_sec = now_ns / NSEC_PER_SEC;
-
-        /* rollover */
-        if (READ_ONCE(g_epoch_sec) != now_sec) {
-            unsigned long flags;
-            spin_lock_irqsave(&cfg_lock, flags);
-            if (g_epoch_sec != now_sec) {
-                sample_window_stats_locked();
-                g_epoch_sec = now_sec;
-                atomic_set(&g_tokens, (int)local_max);
+    /* riprova dopo nuovo reset token */
+    now_ns = ktime_get_ns();
+    if (READ_ONCE(g_monitor_on)) {
+        /* potrebbe ancora essere negativo per race: riprova finché passa o monitor off */
+        while (READ_ONCE(g_monitor_on) && atomic_dec_if_positive(&g_tokens) < 0) {
+            epoch_sec = READ_ONCE(g_epoch_sec);
+            {
+                unsigned int step = 64;
+                while (READ_ONCE(g_monitor_on) && READ_ONCE(g_epoch_sec) == epoch_sec) {
+                    unsigned int i;
+                    for (i = 0; i < step; i++)
+                        cpu_relax();
+                    if (step < 8192)
+                        step <<= 1;
+                }
             }
-            spin_unlock_irqrestore(&cfg_lock, flags);
+            now_ns = ktime_get_ns();
         }
-
-        if (atomic_dec_if_positive(&g_tokens) >= 0)
-            break;
-
-        deadline_ns = (now_sec + 1) * NSEC_PER_SEC;
     }
 
     atomic_dec(&blocked_now);
@@ -609,14 +620,28 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
     case SCTH_IOC_SET_MAX: {
         struct scth_max_req req;
         if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
-        g_max_per_sec = (req.max_per_sec == 0 ? 1 : req.max_per_sec);
+        g_max_next = (req.max_per_sec == 0 ? 1 : req.max_per_sec);
         break;
     }
     case SCTH_IOC_MON_ON:
         g_monitor_on = true;
+
+        u64 now_ns_local = ktime_get_ns();
+        epoch_rollover_locked(now_ns_local);
+
+        /* start timer una sola volta */
+        if (atomic_cmpxchg(&epoch_timer_on, 0, 1) == 0) {
+            hrtimer_start(&epoch_timer, ktime_set(1, 0), HRTIMER_MODE_REL);
+        }
         break;
     case SCTH_IOC_MON_OFF:
         g_monitor_on = false;
+
+        if (atomic_cmpxchg(&epoch_timer_on, 1, 0) == 1) {
+            spin_unlock_irqrestore(&cfg_lock, flags);
+            hrtimer_cancel(&epoch_timer);
+            spin_lock_irqsave(&cfg_lock, flags);
+        }
         break;
 
     case SCTH_IOC_LIST_PROG:
@@ -678,7 +703,8 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         st.peak_euid = peak_uid;
         st.peak_blocked_threads = peak_blocked;
         st.avg_blocked_threads_x1000 = avg_x1000;
-        st.max_per_sec = g_max_per_sec;
+        st.max_current_per_sec = g_max_current;
+        st.max_next_per_sec = g_max_next;
         st.monitor_on = g_monitor_on ? 1 : 0;
 
         spin_unlock_irqrestore(&cfg_lock, flags);
@@ -693,6 +719,8 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         peak_blocked = 0;
         sum_blocked = 0;
         n_windows = 0;
+
+        g_max_current = g_max_next;
 
         /* reset finestra */
         win_start_ns = 0;
@@ -773,6 +801,10 @@ static int __init scth_init(void)
     hash_init(uid_ht);
     hash_init(sys_ht);
 
+    /* init hrtimer */
+    hrtimer_setup(&epoch_timer, epoch_timer_cb, CLOCK_REALTIME, HRTIMER_MODE_REL);
+    atomic_set(&epoch_timer_on, 0);
+
     ret = misc_register(&scth_dev);
     if (ret) {
         pr_err("scth: misc_register failed: %d\n", ret);
@@ -791,12 +823,16 @@ static int __init scth_init(void)
         return ret;
     }
 
-    pr_info("scth: loaded (/dev/%s). monitor_off, MAX=%u\n", scth_dev.name, g_max_per_sec);
+    pr_info("scth: loaded (/dev/%s). monitor_off, MAXcur=%u MAXnext=%u mode=%u\n", scth_dev.name, g_max_current, g_max_next, g_mode);
     return 0;
 }
 
 static void __exit scth_exit(void)
 {
+
+    if (atomic_cmpxchg(&epoch_timer_on, 1, 0) == 1)
+        hrtimer_cancel(&epoch_timer);
+
     unregister_kprobe(&kp);
     misc_deregister(&scth_dev);
 

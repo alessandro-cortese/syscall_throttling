@@ -132,11 +132,9 @@ static void cmd_stats(int fd)
     struct scth_stats st;
     if (ioctl(fd, SCTH_IOC_GET_STATS, &st) < 0) die("ioctl GET_STATS");
 
-    printf("monitor_on=%u  max_per_sec=%u\n", st.monitor_on, st.max_per_sec);
-    printf("peak_delay_ns=%llu  peak_prog=%s  peak_uid=%u\n",
-           (unsigned long long)st.peak_delay_ns, st.peak_prog, st.peak_euid);
-    printf("peak_blocked_threads=%u  avg_blocked_threads=%.3f\n",
-           st.peak_blocked_threads, st.avg_blocked_threads_x1000 / 1000.0);
+    printf("monitor_on=%u  max_current_per_sec=%u  max_next_per_sec=%u\n", st.monitor_on, st.max_current_per_sec, st.max_next_per_sec);
+    printf("peak_delay_ns=%llu  peak_prog=%s  peak_uid=%u\n", (unsigned long long)st.peak_delay_ns, st.peak_prog, st.peak_euid);
+    printf("peak_blocked_threads=%u  avg_blocked_threads=%.3f\n", st.peak_blocked_threads, st.avg_blocked_threads_x1000 / 1000.0);
 }
 
 static void cmd_resetstats(int fd)

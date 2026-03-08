@@ -44,9 +44,10 @@ struct scth_stats {
     __u32 peak_euid;
 
     __u32 peak_blocked_threads;
-    __u64 avg_blocked_threads_x1000; /* media * 1000 per evitare float */
+    __u64 avg_blocked_threads_x1000; /* media * 1000 */
 
-    __u32 max_per_sec;
+    __u32 max_current_per_sec;  /* NEW: valore applicato nell'epoca corrente */
+    __u32 max_next_per_sec;     /* NEW: ultimo valore impostato via ioctl, vale dalla prossima epoca */
     __u32 monitor_on;
 };
 
