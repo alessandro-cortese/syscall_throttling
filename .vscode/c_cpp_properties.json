@@ -1,0 +1,28 @@
+{
+  "version": 4,
+  "configurations": [
+    {
+      "name": "Linux Kernel Module",
+      "compilerPath": "/usr/bin/gcc",
+      "intelliSenseMode": "linux-gcc-x64",
+      "cStandard": "gnu11",
+      "defines": [
+        "KERNEL",
+        "MODULE",
+        "KBUILD_MODNAME=\"snapshot\""
+      ],
+      "includePath": [
+        "/lib/modules/6.14.0-29-generic/build/include/**",
+        "/lib/modules/6.14.0-29-generic/build/include/generated/**",
+        "/lib/modules/6.14.0-29-generic/build/arch/x86/include/**",
+        "/lib/modules/6.14.0-29-generic/build/arch/x86/include/generated/**",
+        "/lib/modules/6.14.0-29-generic/build/include/uapi/**",
+        "/lib/modules/6.14.0-29-generic/build/arch/x86/include/uapi/**",
+        "/lib/modules/6.14.0-29-generic/build/include/generated/uapi/**"
+      ],
+      "forcedInclude": [
+        "/lib/modules/6.14.0-29-generic/build/include/generated/autoconf.h"
+      ]
+    }
+  ]
+}
