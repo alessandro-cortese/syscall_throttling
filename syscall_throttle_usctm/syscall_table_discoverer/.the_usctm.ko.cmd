@@ -1,0 +1,1 @@
+savedcmd_the_usctm.ko := ld -r -m elf_x86_64 -z noexecstack --no-warn-rwx-segments --build-id=sha1  -T /usr/src/linux-headers-6.17.0-14-generic/scripts/module.lds -o the_usctm.ko the_usctm.o the_usctm.mod.o .module-common.o
