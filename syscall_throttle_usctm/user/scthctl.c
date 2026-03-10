@@ -142,12 +142,6 @@ static void cmd_resetstats(int fd)
     if (ioctl(fd, SCTH_IOC_RESET_STATS) < 0) die("ioctl RESET_STATS");
 }
 
-static void cmd_setmode(int fd, uint32_t mode)
-{
-    struct scth_mode_req r = { .mode = mode };
-    if (ioctl(fd, SCTH_IOC_SET_MODE, &r) < 0) die("ioctl SET_MODE");
-}
-
 static void usage(const char *p)
 {
     fprintf(stderr,
@@ -191,7 +185,6 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "listsys")    && argc == 2)       cmd_listsys(fd);
     else if (!strcmp(argv[1], "stats")      && argc == 2)       cmd_stats(fd);
     else if (!strcmp(argv[1], "resetstats") && argc == 2)       cmd_resetstats(fd);
-    else if (!strcmp(argv[1], "setmode")    && argc == 3)       cmd_setmode(fd, (uint32_t)strtoul(argv[2], 0, 10));
     else usage(argv[0]);
 
     close(fd);

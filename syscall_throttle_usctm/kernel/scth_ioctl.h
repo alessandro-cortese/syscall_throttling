@@ -51,10 +51,6 @@ struct scth_stats {
     __u32 monitor_on;
 };
 
-struct scth_mode_req {
-    __u32 mode;  /* 0=baseline, 1=backoff, 2=atomic_tokens */
-};
-
 struct scth_addr_req {
     __u64 sys_call_table_addr;
 };
@@ -78,8 +74,6 @@ struct scth_addr_req {
 
 #define SCTH_IOC_RESET_STATS  _IO(SCTH_IOC_MAGIC, 14)
 
-#define SCTH_IOC_SET_MODE     _IOW(SCTH_IOC_MAGIC, 15, struct scth_mode_req)
-
-#define SCTH_IOC_SET_SCT_ADDR _IOW(SCTH_IOC_MAGIC, 16, struct scth_addr_req)
+#define SCTH_IOC_SET_SCT_ADDR _IOW(SCTH_IOC_MAGIC, 15, struct scth_addr_req)
 
 #endif
