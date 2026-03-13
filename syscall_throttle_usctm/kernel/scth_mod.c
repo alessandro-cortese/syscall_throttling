@@ -21,10 +21,18 @@
 #include <linux/err.h>
 #include <linux/file.h>
 #include <linux/string.h>
+#include <linux/kallsyms.h>
+#include <asm/cacheflush.h>
+#include <asm/processor.h>
+#include <linux/mm.h>
+#include <linux/uaccess.h>
 
 #include "scth_ioctl.h"
 #define USCTM_SYSFS_PATH "/sys/module/the_usctm/parameters/sys_call_table_address"
 #define HT_BITS 10
+extern void **usctm_get_sys_call_table(void);
+
+static unsigned long scth_cr0, scth_cr4;
 
 static struct hrtimer epoch_timer;
 static atomic_t epoch_timer_on = ATOMIC_INIT(0);
@@ -113,6 +121,64 @@ static DEFINE_HASHTABLE(hook_ht, HT_BITS);
 static wait_queue_head_t epoch_wq;
 static atomic64_t epoch_id = ATOMIC64_INIT(0);
 
+static inline void scth_write_cr0_forced(unsigned long val)
+{
+    unsigned long __force_order;
+    asm volatile("mov %0, %%cr0" : "+r"(val), "+m"(__force_order));
+}
+
+static inline void scth_write_cr4_forced(unsigned long val)
+{
+    unsigned long __force_order;
+    asm volatile("mov %0, %%cr4" : "+r"(val), "+m"(__force_order));
+}
+
+static inline void scth_conditional_cet_disable(void)
+{
+#ifdef X86_CR4_CET
+    if (scth_cr4 & X86_CR4_CET)
+        scth_write_cr4_forced(scth_cr4 & ~X86_CR4_CET);
+#endif
+}
+
+static inline void scth_conditional_cet_enable(void)
+{
+#ifdef X86_CR4_CET
+    if (scth_cr4 & X86_CR4_CET)
+        scth_write_cr4_forced(scth_cr4);
+#endif
+}
+
+static inline void scth_begin_syscall_table_patch(void)
+{
+    preempt_disable();
+    barrier();
+    scth_cr0 = read_cr0();
+    scth_cr4 = native_read_cr4();
+    scth_conditional_cet_disable();
+    scth_write_cr0_forced(scth_cr0 & ~X86_CR0_WP); /* WP off */
+    barrier();
+}
+
+static inline void scth_end_syscall_table_patch(void)
+{
+    barrier();
+    scth_write_cr0_forced(scth_cr0);              /* restore WP */
+    scth_conditional_cet_enable();
+    barrier();
+    preempt_enable();
+}
+
+/* scrive sys_call_table[nr] = fn in modo safe; WP/CET gestiti dal chiamante */
+static int scth_write_sct_entry(u32 nr, void *fn)
+{
+    if (!sys_call_table)
+        return -EINVAL;
+
+    WRITE_ONCE(sys_call_table[nr], fn);
+    return 0;
+}
+
 static sys_fn_t hook_get_orig(u32 nr)
 {
     struct hook_ent *e;
@@ -152,51 +218,53 @@ static bool match_request(u32 nr, const char *comm, u32 euid)
 static void throttle_sleeping(const char *comm, u32 euid, u64 now_ns)
 {
     u64 local_start = 0;
-    u64 my_epoch;
 
-    /* se monitor off non facciamo nulla */
     if (!READ_ONCE(g_monitor_on))
         return;
 
     for (;;) {
         unsigned long flags;
-        bool allowed = false;
         u32 local_max;
+        bool allowed = false;
 
         spin_lock_irqsave(&cfg_lock, flags);
 
-        local_max = g_max_current;
+        local_max = READ_ONCE(g_max_current);
         if (local_max == 0)
             local_max = 1;
 
         if (win_count < local_max) {
             win_count++;
             allowed = true;
-        } else {
-            /* epoca corrente finita: ricorda epoch per dormire fuori lock */
-            my_epoch = atomic64_read(&epoch_id);
         }
 
         spin_unlock_irqrestore(&cfg_lock, flags);
 
-        if (allowed)
+        if (allowed) {
+            if (local_start) {
+                atomic_dec(&blocked_now);
+                update_peak_delay(comm, euid, ktime_get_ns() - local_start);
+            }
             return;
+        }
 
-        /* oltre MAX: dormi fino a cambio epoca */
-        if (local_start == 0) {
+        if (!local_start) {
             local_start = now_ns;
             atomic_inc(&blocked_now);
         }
 
-        /* wait until epoch changes or monitor goes off */
-        wait_event_interruptible(epoch_wq,
-            (!READ_ONCE(g_monitor_on)) || (atomic64_read(&epoch_id) != my_epoch));
+        /* anti-lost-wakeup */
+        {
+            u64 my_epoch = atomic64_read(&epoch_id);
+            wait_event(epoch_wq,
+                       (!READ_ONCE(g_monitor_on)) ||
+                       (atomic64_read(&epoch_id) != my_epoch));
+        }
 
         if (!READ_ONCE(g_monitor_on))
             break;
 
         now_ns = ktime_get_ns();
-        /* riprova: nuova epoca dovrebbe aver resettato win_count */
     }
 
     if (local_start) {
@@ -239,10 +307,12 @@ static int install_hook(u32 nr)
     struct hook_ent *he;
     sys_fn_t cur;
     u32 h;
+    int ret;
 
     if (!sys_call_table)
         return -EINVAL;
 
+    /* già installato? */
     if (hook_is_installed(nr))
         return 0;
 
@@ -258,13 +328,50 @@ static int install_hook(u32 nr)
     he->orig = cur;
     h = jhash(&nr, sizeof(nr), 0);
 
-    /* proteggo hook_ht */
+    /*
+     * 1) Patch sys_call_table PRIMA di rendere visibile l’entry in hook_ht
+     *    (così lo stub non può mai vedere orig “registrata” ma entry non patchata)
+     */
+    scth_begin_syscall_table_patch();
+    ret = scth_write_sct_entry(nr, (void *)scth_stub);
+    if (ret) {
+        kfree(he);
+        return ret;
+    }
+    scth_end_syscall_table_patch();
+
+    /*
+     * 2) Ora pubblica l’entry in hook_ht sotto hook_lock.
+     *    Ricontrollo: se qualcuno l’ha installato nel frattempo, rollback e torna.
+     */
     spin_lock(&hook_lock);
-    hash_add(hook_ht, &he->node, h);
+    {
+        struct hook_ent *e2;
+        bool already = false;
+
+        hash_for_each_possible(hook_ht, e2, node, h) {
+            if (e2->nr == nr) {
+                already = true;
+                break;
+            }
+        }
+
+        if (already) {
+            spin_unlock(&hook_lock);
+
+            /* rollback patch */
+            scth_begin_syscall_table_patch();
+            (void)scth_write_sct_entry(nr, (void *)cur);
+            scth_end_syscall_table_patch();
+
+            kfree(he);
+            return 0;
+        }
+
+        hash_add(hook_ht, &he->node, h);
+    }
     spin_unlock(&hook_lock);
 
-    /* patch entry */
-    WRITE_ONCE(sys_call_table[nr], (void *)scth_stub);
     return 0;
 }
 
@@ -273,24 +380,35 @@ static int remove_hook(u32 nr)
     struct hook_ent *he;
     struct hlist_node *tmp;
     u32 h;
+    sys_fn_t orig = NULL;
+    int ret;
 
     if (!sys_call_table)
         return -EINVAL;
 
     h = jhash(&nr, sizeof(nr), 0);
 
+    /* 1) trova e stacca da hook_ht sotto lock */
     spin_lock(&hook_lock);
     hash_for_each_possible_safe(hook_ht, he, tmp, node, h) {
         if (he->nr == nr) {
-            /* restore entry */
-            WRITE_ONCE(sys_call_table[nr], (void *)he->orig);
+            orig = he->orig;
             hash_del(&he->node);
             spin_unlock(&hook_lock);
+
+            /* 2) ripristina la sys_call_table FUORI dallo spinlock */
+            scth_begin_syscall_table_patch();
+            ret = scth_write_sct_entry(nr, (void *)orig);
+            if (ret)
+                pr_err("scth: failed restoring sys_call_table[%u]\n", nr);
+            scth_end_syscall_table_patch();
+
             kfree(he);
             return 0;
         }
     }
     spin_unlock(&hook_lock);
+
     return -ENOENT;
 }
 
@@ -303,18 +421,35 @@ static void remove_all_hooks(void)
     if (!sys_call_table)
         return;
 
-    /* Stacchiamo gli elementi dalla hash table sotto spinlock,
-       poi li liberiamo fuori lock. */
     for (b = 0; b < (1 << HT_BITS); b++) {
-        spin_lock(&hook_lock);
-        hlist_for_each_entry_safe(he, tmp, &hook_ht[b], node) {
-            WRITE_ONCE(sys_call_table[he->nr], (void *)he->orig);
-            hlist_del(&he->node);
-            spin_unlock(&hook_lock);
-            kfree(he);
+        for (;;) {
+            u32 nr;
+            sys_fn_t orig;
+
+            /* 1) prendi un elemento e staccalo dalla lista sotto spinlock */
             spin_lock(&hook_lock);
+
+            he = NULL;
+            hlist_for_each_entry_safe(he, tmp, &hook_ht[b], node) {
+                hlist_del(&he->node);
+                break; /* staccato il primo, esci */
+            }
+
+            spin_unlock(&hook_lock);
+
+            if (!he)
+                break; /* bucket vuoto */
+
+            nr = he->nr;
+            orig = he->orig;
+
+            /* 2) ripristina entry FUORI dallo spinlock */
+            scth_begin_syscall_table_patch();
+            WRITE_ONCE(sys_call_table[nr], (void *)orig);
+            scth_end_syscall_table_patch();
+
+            kfree(he);
         }
-        spin_unlock(&hook_lock);
     }
 }
 
@@ -462,7 +597,6 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
     case SCTH_IOC_SET_MAX:
     case SCTH_IOC_MON_ON:
     case SCTH_IOC_MON_OFF:
-    case SCTH_IOC_SET_SCT_ADDR:
     case SCTH_IOC_RESET_STATS:
         if (!caller_is_root())
             return -EPERM;
@@ -532,32 +666,56 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         }
         break;
     }
+
     case SCTH_IOC_ADD_SYSCALL: {
         struct scth_sys_req req;
         struct sys_ent *e;
         u32 h;
+
         if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
         if (!sys_call_table) { ret = -EINVAL; break; }
         if (sys_is_registered(req.nr)) break;
+
+        /* install hook FUORI dallo spinlock cfg_lock */
+        spin_unlock_irqrestore(&cfg_lock, flags);
+        mutex_lock(&hook_mutex);
+        ret = install_hook(req.nr);
+        mutex_unlock(&hook_mutex);
+        spin_lock_irqsave(&cfg_lock, flags);
+
+        if (ret)
+            break;
+
+        /* solo se hook ok, registra la syscall nella ht */
         e = kzalloc(sizeof(*e), GFP_ATOMIC);
         if (!e) { ret = -ENOMEM; break; }
         e->nr = req.nr;
         h = jhash(&e->nr, sizeof(e->nr), 0);
         e->h = h;
         hash_add(sys_ht, &e->node, e->h);
-        spin_unlock_irqrestore(&cfg_lock, flags);
-        mutex_lock(&hook_mutex);
-        ret = install_hook(req.nr);
-        mutex_unlock(&hook_mutex);
-        spin_lock_irqsave(&cfg_lock, flags);
+
         break;
     }
+
     case SCTH_IOC_DEL_SYSCALL: {
         struct scth_sys_req req;
         struct sys_ent *e;
         u32 h;
+
         if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
         if (!sys_call_table) { ret = -EINVAL; break; }
+
+        /* rimuovi hook FUORI cfg_lock */
+        spin_unlock_irqrestore(&cfg_lock, flags);
+        mutex_lock(&hook_mutex);
+        ret = remove_hook(req.nr);
+        mutex_unlock(&hook_mutex);
+        spin_lock_irqsave(&cfg_lock, flags);
+
+        if (ret)
+            break;
+
+        /* solo se hook rimosso, rimuovi anche da sys_ht */
         h = jhash(&req.nr, sizeof(req.nr), 0);
         hash_for_each_possible(sys_ht, e, node, h) {
             if (e->nr == req.nr) {
@@ -566,19 +724,16 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
                 break;
             }
         }
-        spin_unlock_irqrestore(&cfg_lock, flags);
-        mutex_lock(&hook_mutex);
-        remove_hook(req.nr);
-        mutex_unlock(&hook_mutex);
-        spin_lock_irqsave(&cfg_lock, flags);
         break;
     }
+    
     case SCTH_IOC_SET_MAX: {
         struct scth_max_req req;
         if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
         g_max_next = (req.max_per_sec == 0 ? 1 : req.max_per_sec);
         break;
     }
+    
     case SCTH_IOC_MON_ON: {
         g_monitor_on = true;
 
@@ -591,6 +746,7 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         }
         break;
     }
+    
     case SCTH_IOC_MON_OFF:
         g_monitor_on = false;
 
@@ -687,24 +843,6 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         break;
     }
 
-    case SCTH_IOC_SET_SCT_ADDR: {
-        struct scth_addr_req req;
-        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
-        if (req.sys_call_table_addr == 0) { ret = -EINVAL; break; }
-
-        /* se avevi hook installati, meglio rimuoverli prima di cambiare tabella */
-        spin_unlock_irqrestore(&cfg_lock, flags);
-        mutex_lock(&hook_mutex);
-        remove_all_hooks();
-        sys_call_table = (void **)(uintptr_t)req.sys_call_table_addr;
-        mutex_unlock(&hook_mutex);
-        spin_lock_irqsave(&cfg_lock, flags);
-
-        pr_info("scth: sys_call_table set to %px\n", sys_call_table);
-        break;
-}
-
-
     default:
         ret = -ENOTTY;
         break;
@@ -798,7 +936,7 @@ static int __init scth_init(void)
     hash_init(hook_ht);
 
     /* init hrtimer */
-    hrtimer_setup(&epoch_timer, epoch_timer_cb, CLOCK_REALTIME, HRTIMER_MODE_REL);
+    hrtimer_setup(&epoch_timer, epoch_timer_cb, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
     atomic_set(&epoch_timer_on, 0);
 
     ret = misc_register(&scth_dev);
@@ -807,17 +945,24 @@ static int __init scth_init(void)
         return ret;
     }
 
-    /* auto-detect sys_call_table from USCTM sysfs */
-    {
+    void **(*getter)(void) = NULL;
+
+    getter = symbol_get(usctm_get_sys_call_table);
+    if (getter) {
+        sys_call_table = getter();
+        symbol_put(usctm_get_sys_call_table);
+    }
+
+    if (sys_call_table)
+        pr_info("scth: sys_call_table=%px (from usctm symbol_get)\n", sys_call_table);
+    else
+        pr_warn("scth: cannot get sys_call_table from usctm (symbol not found). Using sysfs/ioctl.\n");
+
+    if (!sys_call_table) {
         u64 addr = 0;
-        int r = read_u64_from_sysfs(USCTM_SYSFS_PATH, &addr);
-        if (r == 0 && addr != 0) {
-            mutex_lock(&hook_mutex);
+        if (read_u64_from_sysfs(USCTM_SYSFS_PATH, &addr) == 0 && addr) {
             sys_call_table = (void **)(uintptr_t)addr;
-            mutex_unlock(&hook_mutex);
-            pr_info("scth: auto sys_call_table=%px (from %s)\n", sys_call_table, USCTM_SYSFS_PATH);
-        } else {
-            pr_warn("scth: cannot read %s (err=%d). Use ioctl SET_SCT_ADDR.\n", USCTM_SYSFS_PATH, r);
+            pr_info("scth: sys_call_table=%px (from sysfs fallback)\n", sys_call_table);
         }
     }
 

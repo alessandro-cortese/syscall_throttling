@@ -72,7 +72,7 @@ extern int sys_vtpmo(unsigned long vaddr);
 int good_area(unsigned long *);
 int validate_page(unsigned long *);
 void syscall_table_finder(void);
-
+void **usctm_get_sys_call_table(void);
 
 unsigned long *hacked_ni_syscall=NULL;
 unsigned long **hacked_syscall_tbl=NULL;
@@ -83,6 +83,14 @@ module_param(sys_call_table_address, ulong, 0660);
 unsigned long sys_ni_syscall_address = 0x0;
 module_param(sys_ni_syscall_address, ulong, 0660);
 
+/* --- Exported API: allow other LKMs to retrieve syscall table address --- */
+void **usctm_get_sys_call_table(void)
+{
+    if (!sys_call_table_address)
+        return NULL;
+    return (void **)(uintptr_t)sys_call_table_address;
+}
+EXPORT_SYMBOL_GPL(usctm_get_sys_call_table);
 
 int good_area(unsigned long * addr){
 	int i;
