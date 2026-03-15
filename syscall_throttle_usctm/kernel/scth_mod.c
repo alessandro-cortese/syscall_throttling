@@ -256,9 +256,10 @@ static void throttle_sleeping(const char *comm, u32 euid, u64 now_ns)
         /* anti-lost-wakeup */
         {
             u64 my_epoch = atomic64_read(&epoch_id);
-            wait_event(epoch_wq,
-                       (!READ_ONCE(g_monitor_on)) ||
-                       (atomic64_read(&epoch_id) != my_epoch));
+            int wret = wait_event_killable(epoch_wq, (!READ_ONCE(g_monitor_on)) || (atomic64_read(&epoch_id) != my_epoch));
+            if (wret) { /* segnale ricevuto (es. SIGKILL) */
+                break;
+            }
         }
 
         if (!READ_ONCE(g_monitor_on))
@@ -598,6 +599,7 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
     case SCTH_IOC_MON_ON:
     case SCTH_IOC_MON_OFF:
     case SCTH_IOC_RESET_STATS:
+    case SCTH_IOC_WAKE_WAITERS:
         if (!caller_is_root())
             return -EPERM;
         break;
@@ -749,7 +751,8 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
     
     case SCTH_IOC_MON_OFF:
         g_monitor_on = false;
-
+        wake_up_all(&epoch_wq);
+    
         if (atomic_cmpxchg(&epoch_timer_on, 1, 0) == 1) {
             spin_unlock_irqrestore(&cfg_lock, flags);
             hrtimer_cancel(&epoch_timer);
@@ -840,6 +843,19 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         win_count = 0;
         atomic_set(&blocked_now, 0);
 
+        break;
+    }
+
+    case SCTH_IOC_WAKE_WAITERS: {
+        /*
+        * Sblocca eventuali thread addormentati nel throttle:
+        * - bump epoch_id => condizione (epoch_id != my_epoch) diventa vera
+        * - wake_up_all  => non aspettiamo il prossimo tick
+        *
+        * NOTA: non modifica contatori/stats.
+        */
+        atomic64_inc(&epoch_id);
+        wake_up_all(&epoch_wq);
         break;
     }
 

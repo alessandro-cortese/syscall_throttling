@@ -76,4 +76,6 @@ struct scth_addr_req {
 
 #define SCTH_IOC_SET_SCT_ADDR _IOW(SCTH_IOC_MAGIC, 15, struct scth_addr_req)
 
+#define SCTH_IOC_WAKE_WAITERS   _IO(SCTH_IOC_MAGIC, 16)
+
 #endif

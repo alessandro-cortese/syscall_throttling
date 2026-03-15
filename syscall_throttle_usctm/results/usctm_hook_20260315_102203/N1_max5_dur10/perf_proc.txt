@@ -1,0 +1,9 @@
+
+ Performance counter stats for process id '6366':
+
+           197.054      task-clock                       #    0,000 CPUs utilized             
+                10      context-switches                 #   50,748 K/sec                     
+                 1      cpu-migrations                   #    5,075 K/sec                     
+
+      10,001698069 seconds time elapsed
+

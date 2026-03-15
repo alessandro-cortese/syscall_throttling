@@ -1,0 +1,9 @@
+
+ Performance counter stats for process id '5351':
+
+           353.079      task-clock                       #    0,000 CPUs utilized             
+                10      context-switches                 #   28,322 K/sec                     
+                 0      cpu-migrations                   #    0,000 /sec                      
+
+      10,002853153 seconds time elapsed
+
