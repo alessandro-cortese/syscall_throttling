@@ -1,0 +1,9 @@
+
+ Performance counter stats for process id '5683':
+
+       10001394001      task-clock                       #    1.000 CPUs utilized             
+                 2      context-switches                 #    0.200 /sec                      
+                 0      cpu-migrations                   #    0.000 /sec                      
+
+      10.000989172 seconds time elapsed
+

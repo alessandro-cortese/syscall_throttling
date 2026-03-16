@@ -1,9 +1,0 @@
-Linux 6.17.0-14-generic (ale-VM) 	07/03/2026 	_x86_64_	(16 CPU)
-
-10:11:49      UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
-10:11:50     1000      6998    0,00  100,00    0,00    0,00  100,00     7  tester_getpid
-10:11:51     1000      6998    0,00  100,00    0,00    0,00  100,00     7  tester_getpid
-10:11:52     1000      6998    0,00  100,00    0,00    0,00  100,00     7  tester_getpid
-10:11:53     1000      6998    0,00  100,00    0,00    0,00  100,00     7  tester_getpid
-10:11:54     1000      6998    0,00  100,00    0,00    0,00  100,00     7  tester_getpid
-Media:       1000      6998    0,00  100,00    0,00    0,00  100,00     -  tester_getpid

@@ -1,0 +1,9 @@
+
+ Performance counter stats for 'system wide':
+
+      926014154880      task-clock                       #   25.027 CPUs utilized             
+             59035      context-switches                 #   63.752 /sec                      
+               238      cpu-migrations                   #    0.257 /sec                      
+
+      37.000178214 seconds time elapsed
+

@@ -1,9 +1,0 @@
-
- Performance counter stats for process id '6918,6919,6920,6921,6922,6923,6924,6925,6926,6927,6928,6929,6930,6931,6932,6933,6935,6936,6937,6938,6939,6940,6941,6942,6943,6944,6945,6946,6947,6948,6949,6950':
-
-        17.688.747      task-clock                       #    0,002 CPUs utilized             
-               339      context-switches                 #   19,165 K/sec                     
-                16      cpu-migrations                   #  904,530 /sec                      
-
-      10,007722970 seconds time elapsed
-

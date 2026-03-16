@@ -1,8 +1,0 @@
-
- Performance counter stats for process id '6477':
-
-   <not supported>      cycles                                                                
-   <not supported>      instructions                                                          
-
-       5,001308187 seconds time elapsed
-

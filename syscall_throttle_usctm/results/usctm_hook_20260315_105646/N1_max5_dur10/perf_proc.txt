@@ -1,9 +1,0 @@
-
- Performance counter stats for process id '8145':
-
-           707.799      task-clock                       #    0,000 CPUs utilized             
-                10      context-switches                 #   14,128 K/sec                     
-                 0      cpu-migrations                   #    0,000 /sec                      
-
-      10,002650441 seconds time elapsed
-

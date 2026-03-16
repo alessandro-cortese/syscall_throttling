@@ -1,0 +1,9 @@
+
+ Performance counter stats for process id '6302':
+
+       10000492276      task-clock                       #    1.000 CPUs utilized             
+                 7      context-switches                 #    0.700 /sec                      
+                 0      cpu-migrations                   #    0.000 /sec                      
+
+      10.000810534 seconds time elapsed
+

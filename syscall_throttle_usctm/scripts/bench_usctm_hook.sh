@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
+export LC_ALL=C
+export LANG=C
+
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 USER_DIR="$ROOT_DIR/user"
 CTL="$USER_DIR/scthctl"

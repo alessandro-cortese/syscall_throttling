@@ -1,0 +1,9 @@
+
+ Performance counter stats for process id '6585,6586,6587,6588,6589,6590,6591,6592':
+
+       80008302943      task-clock                       #    8.000 CPUs utilized             
+                27      context-switches                 #    0.337 /sec                      
+                 0      cpu-migrations                   #    0.000 /sec                      
+
+      10.001404818 seconds time elapsed
+
