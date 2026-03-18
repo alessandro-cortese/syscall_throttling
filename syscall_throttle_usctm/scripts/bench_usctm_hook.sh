@@ -57,7 +57,6 @@ start_load() {
     pids+=("$!")
   done
 
-  # IMPORTANT: uno per riga, così "mapfile -t" funziona davvero
   printf "%s\n" "${pids[@]}"
 }
 

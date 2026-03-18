@@ -10,77 +10,65 @@
 
 #include "../kernel/scth_ioctl.h"
 
-static void die(const char *msg)
-{
+static void die(const char *msg) {
     perror(msg);
     exit(1);
 }
 
-static int dev_open(void)
-{
+static int dev_open(void) {
     int fd = open("/dev/scth", O_RDWR);
     if (fd < 0) die("open /dev/scth");
     return fd;
 }
 
-static void cmd_addprog(int fd, const char *name)
-{
+static void cmd_addprog(int fd, const char *name) {
     struct scth_prog_req r;
     memset(&r, 0, sizeof(r));
     strncpy(r.name, name, SCTH_MAX_PROG_LEN-1);
     if (ioctl(fd, SCTH_IOC_ADD_PROG, &r) < 0) die("ioctl ADD_PROG");
 }
 
-static void cmd_delprog(int fd, const char *name)
-{
+static void cmd_delprog(int fd, const char *name) {
     struct scth_prog_req r;
     memset(&r, 0, sizeof(r));
     strncpy(r.name, name, SCTH_MAX_PROG_LEN-1);
     if (ioctl(fd, SCTH_IOC_DEL_PROG, &r) < 0) die("ioctl DEL_PROG");
 }
 
-static void cmd_adduid(int fd, uint32_t uid)
-{
+static void cmd_adduid(int fd, uint32_t uid) {
     struct scth_uid_req r = { .euid = uid };
     if (ioctl(fd, SCTH_IOC_ADD_UID, &r) < 0) die("ioctl ADD_UID");
 }
 
-static void cmd_deluid(int fd, uint32_t uid)
-{
+static void cmd_deluid(int fd, uint32_t uid) {
     struct scth_uid_req r = { .euid = uid };
     if (ioctl(fd, SCTH_IOC_DEL_UID, &r) < 0) die("ioctl DEL_UID");
 }
 
-static void cmd_addsys(int fd, uint32_t nr)
-{
+static void cmd_addsys(int fd, uint32_t nr) {
     struct scth_sys_req r = { .nr = nr };
     if (ioctl(fd, SCTH_IOC_ADD_SYSCALL, &r) < 0) die("ioctl ADD_SYSCALL");
 }
 
-static void cmd_delsys(int fd, uint32_t nr)
-{
+static void cmd_delsys(int fd, uint32_t nr) {
     struct scth_sys_req r = { .nr = nr };
     if (ioctl(fd, SCTH_IOC_DEL_SYSCALL, &r) < 0) die("ioctl DEL_SYSCALL");
 }
 
-static void cmd_setmax(int fd, uint32_t max)
-{
+static void cmd_setmax(int fd, uint32_t max) {
     struct scth_max_req r = { .max_per_sec = max };
     if (ioctl(fd, SCTH_IOC_SET_MAX, &r) < 0) die("ioctl SET_MAX");
 }
 
-static void cmd_on(int fd)
-{
+static void cmd_on(int fd) {
     if (ioctl(fd, SCTH_IOC_MON_ON) < 0) die("ioctl MON_ON");
 }
 
-static void cmd_off(int fd)
-{
+static void cmd_off(int fd) {
     if (ioctl(fd, SCTH_IOC_MON_OFF) < 0) die("ioctl MON_OFF");
 }
 
-static void cmd_listprog(int fd)
-{
+static void cmd_listprog(int fd) {
     char buf[SCTH_MAX_LIST][SCTH_MAX_PROG_LEN];
     struct scth_list_resp lr;
 
@@ -95,8 +83,7 @@ static void cmd_listprog(int fd)
         printf("  %s\n", buf[i]);
 }
 
-static void cmd_listuid(int fd)
-{
+static void cmd_listuid(int fd) {
     uint32_t buf[SCTH_MAX_LIST];
     struct scth_list_resp lr;
 
@@ -111,8 +98,7 @@ static void cmd_listuid(int fd)
         printf("  %u\n", buf[i]);
 }
 
-static void cmd_listsys(int fd)
-{
+static void cmd_listsys(int fd) {
     uint32_t buf[SCTH_MAX_LIST];
     struct scth_list_resp lr;
 
@@ -127,8 +113,7 @@ static void cmd_listsys(int fd)
         printf("  %u\n", buf[i]);
 }
 
-static void cmd_stats(int fd)
-{
+static void cmd_stats(int fd) {
     struct scth_stats st;
     if (ioctl(fd, SCTH_IOC_GET_STATS, &st) < 0) die("ioctl GET_STATS");
 
@@ -137,18 +122,15 @@ static void cmd_stats(int fd)
     printf("peak_blocked_threads=%u  avg_blocked_threads=%.3f\n", st.peak_blocked_threads, st.avg_blocked_threads_x1000 / 1000.0);
 }
 
-static void cmd_resetstats(int fd)
-{
+static void cmd_resetstats(int fd) {
     if (ioctl(fd, SCTH_IOC_RESET_STATS) < 0) die("ioctl RESET_STATS");
 }
 
-static void cmd_wakewaiters(int fd)
-{
+static void cmd_wakewaiters(int fd) {
     if (ioctl(fd, SCTH_IOC_WAKE_WAITERS) < 0) die("ioctl WAKE_WAITERS");
 }
 
-static void usage(const char *p)
-{
+static void usage(const char *p) {
     fprintf(stderr,
         "Usage:\n"
         "  %s addprog <comm>\n"
@@ -167,8 +149,7 @@ static void usage(const char *p)
     exit(2);
 }
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
     int fd;
 
     if (argc < 2) usage(argv[0]);
@@ -190,7 +171,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "stats")          && argc == 2)       cmd_stats(fd);
     else if (!strcmp(argv[1], "resetstats")     && argc == 2)       cmd_resetstats(fd);
     else if (!strcmp(argv[1], "wakewaiters")    && argc == 2)       cmd_wakewaiters(fd);
-    else usage(argv[0]);
+    else                                                            usage(argv[0]);
 
     close(fd);
     return 0;

@@ -5,8 +5,8 @@
 #include <stdint.h>
 
 /*
- * Stressa openat/close su /dev/null.
- * Utile se vuoi provare a registrare openat.
+ * Redirects openat/close to /dev/null.
+ * Useful if you want to try recording openat.
  */
 int main(void) {
     uint64_t i = 0;
@@ -15,7 +15,7 @@ int main(void) {
         if (fd >= 0) close(fd);
         i++;
         if (write(1, ".", 1) < 0) {
-            /* se stdout chiuso, basta uscire */
+            /* if stdout is closed, simply exit */
             _exit(1);
         }
     }

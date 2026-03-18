@@ -6,7 +6,7 @@ echo "[*] Setup..."
 ./scripts/setup_test_env.sh >/dev/null
 
 echo
-echo "[TEST 1] monitor OFF -> niente update peak (dopo reset)"
+echo "[TEST 1] monitor OFF -> no peak update, after reset"
 sudo ./user/scthctl off
 sudo ./user/scthctl resetstats
 ./user/tester_getpid &
@@ -28,7 +28,7 @@ kill "$pid" 2>/dev/null || true
 wait "$pid" 2>/dev/null || true
 
 echo
-echo "[TEST 3] due istanze -> peak_blocked dovrebbe crescere"
+echo "[TEST 3] two instances -> peak_blocked should increase"
 sudo ./user/scthctl resetstats
 ./user/tester_getpid &
 p1=$!
@@ -41,5 +41,4 @@ wait "$p1" "$p2" 2>/dev/null || true
 
 echo "[*] Done."
 
-# Per attivare perf
-# sudo sysctl kernel.perf_event_paranoid=1
+# to torn on perf: sudo sysctl kernel.perf_event_paranoid=1

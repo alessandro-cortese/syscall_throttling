@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-echo "[*] Setup base"
+echo "[*] Setup "
 ./scripts/setup_test_env.sh >/dev/null
 sudo ./user/scthctl resetstats
 
@@ -11,21 +11,21 @@ echo "[*] Start tester"
 pid=$!
 sleep 1
 
-echo "[*] stats (prima):"
+echo "[*] stats (before):"
 ./user/scthctl stats
 
-echo "[*] Set MAX più volte nella stessa epoca (vale solo l'ultimo dalla prossima epoca)"
+echo "[*] MAX has been set multiple times within the same epoch (only the last value will apply from the next epoch onwards)"
 sudo ./user/scthctl setmax 10
 sudo ./user/scthctl setmax 20
 sudo ./user/scthctl setmax 5000
 
-echo "[*] stats subito dopo (max_next=5000; max_current ancora vecchio fino a rollover):"
+echo "[*] stats immediately afterwards (max_next=5000; max_current still old until rollover):"
 ./user/scthctl stats
 
-echo "[*] Attendo 2 secondi per superare almeno un rollover..."
+echo "[*] I'll wait 2 seconds to get past at least one rollover..."
 sleep 2
 
-echo "[*] stats dopo rollover (max_current dovrebbe diventare 5000):"
+echo "[*] stats after rollover (max_current should become 5000):"
 ./user/scthctl stats
 
 kill "$pid" 2>/dev/null || true

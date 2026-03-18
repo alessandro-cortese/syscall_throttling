@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# Config base: solo programma tester_getpid, syscall 39
+# base config: only tester_getpid, syscall 39
 sudo ./user/scthctl off || true
 sudo ./user/scthctl deluid 1000 2>/dev/null || true
 sudo ./user/scthctl delprog tester_getpid 2>/dev/null || true

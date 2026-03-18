@@ -42,7 +42,7 @@ run_one() {
   echo "[*] perf stat software events (${DUR}s) (pid=${pids[0]})"
   sudo perf stat -e "$EVENTS" -p "${pids[0]}" sleep "$DUR" 2>&1 | tee "$OUTDIR/perf_N${nprocs}.txt" || true
 
-  echo "[*] stats (modulo):"
+  echo "[*] stats (module):"
   ./user/scthctl stats | tee "$OUTDIR/scth_stats_N${nprocs}.txt"
 
   for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
@@ -53,4 +53,4 @@ run_one "$N1"
 run_one "$N2"
 
 echo
-echo "[*] Salvati risultati in: $OUTDIR"
+echo "[*] results saved in: $OUTDIR"

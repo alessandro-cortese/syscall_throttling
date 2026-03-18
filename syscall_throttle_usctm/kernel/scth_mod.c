@@ -69,7 +69,8 @@ static DEFINE_HASHTABLE(prog_ht, HT_BITS);
 static DEFINE_HASHTABLE(uid_ht,  HT_BITS);
 static DEFINE_HASHTABLE(sys_ht,  HT_BITS);
 
-static DEFINE_SPINLOCK(cfg_lock); /* protects hash tables and configuration files */
+/* protects hash tables and configuration files */
+static DEFINE_SPINLOCK(cfg_lock); 
 
 /* *****************************
  * Monitor state + stats

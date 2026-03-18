@@ -9,11 +9,11 @@ TESTER="$USER/tester_getpid"
 echo "[*] Root dir: $ROOT_DIR"
 
 if [[ ! -x "$CTL" ]]; then
-  echo "[!] scthctl non trovato: $CTL"
+  echo "[!] scthctl not found: $CTL"
   exit 1
 fi
 if [[ ! -x "$TESTER" ]]; then
-  echo "[!] tester_getpid non trovato: $TESTER"
+  echo "[!] tester_getpid not found: $TESTER"
   exit 1
 fi
 

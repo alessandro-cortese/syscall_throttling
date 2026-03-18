@@ -4,8 +4,8 @@
 #include <stdio.h>
 
 /*
- * Genera un numero enorme di syscall getpid() (nr=39 su x86_64).
- * Stampa un puntino ogni tanto per vedere che è vivo.
+ * Generates a huge number of getpid() system calls, 39 on x86_64.
+ * Prints a dot every now and then to show it's still running.
  */
 int main(void) {
     uint64_t i = 0;
@@ -14,7 +14,7 @@ int main(void) {
         i++;
         if ((i % 10000000ULL) == 0) {
             if (write(1, ".", 1) < 0) {
-                /* se stdout chiuso, basta uscire */
+                /* if stdout is closed, simply exit */
                 _exit(1);
             }
         }
