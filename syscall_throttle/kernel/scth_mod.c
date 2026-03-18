@@ -21,27 +21,28 @@
 #include "scth_ioctl.h"
 
 
-/* modalità throttling:
- * 0 = baseline (lock+busy)
- * 1 = backoff (deadline + polling raro)
- * 2 = atomic tokens (fast path lockless + rollover lock)
+/* Throttling mode:
+ * 0 = baseline, lock + busy
+ * 1 = backoff, deadline + polling
+ * 2 = atomic tokens, fast path lockless + rollover lock
  */
 static u32 g_mode = 0;
 
 /* token bucket per MODE 2 */
 static atomic_t g_tokens = ATOMIC_INIT(0);
-/* epoch finestra (in secondi) per rollover) */
+/* window epoch, in seconds, for rollover */
 static u64 g_epoch_sec = 0;
 
 static struct hrtimer epoch_timer;
 static atomic_t epoch_timer_on = ATOMIC_INIT(0);
 
 module_param(g_mode, uint, 0644);
-MODULE_PARM_DESC(g_mode, "Throttle mode: 0=baseline,1=backoff,2=atomic_tokens");
+MODULE_PARM_DESC(g_mode, "Throttle mode: 0 = baseline, 1 = backoff, 2 = atomic_tokens");
 
-/* -----------------------------
+/* *******************************
  * Hash sets: prog / uid / syscall
- * ----------------------------- */
+ * *******************************
+ * */
 
 #define HT_BITS 10
 
@@ -67,26 +68,28 @@ static DEFINE_HASHTABLE(prog_ht, HT_BITS);
 static DEFINE_HASHTABLE(uid_ht,  HT_BITS);
 static DEFINE_HASHTABLE(sys_ht,  HT_BITS);
 
-static DEFINE_SPINLOCK(cfg_lock); /* protegge hash tables + monitor config */
+/* protects hash tables and configuration files */
+static DEFINE_SPINLOCK(cfg_lock); 
 
-/* -----------------------------
+/* *****************************
  * Monitor state + stats
- * ----------------------------- */
+ * *****************************
+ *  */
 
-/* configurazione */
+/* config */
 static u32 g_max_current = 100;
 static u32 g_max_next = 100;
 static bool g_monitor_on = false;
 
-/* finestra 1s */
+/* 1s window */
 static u64 win_start_ns = 0;
 static u32 win_count = 0;
 
-/* contatori thread bloccati (busy wait) */
+/* blocked thread counters, busy wait */
 static atomic_t blocked_now = ATOMIC_INIT(0);
 static u32 peak_blocked = 0;
 
-/* campionamento per "avg blocked threads" */
+/* sampling for ‘avg blocked threads’ */
 static u64 sum_blocked = 0;
 static u64 n_windows = 0;
 
@@ -95,18 +98,17 @@ static u64 peak_delay_ns = 0;
 static char peak_prog[SCTH_MAX_PROG_LEN] = {0};
 static u32  peak_uid = 0;
 
-/* -----------------------------
+/* ******************************
  * Helpers hashing / lookup
- * ----------------------------- */
+ * ******************************
+ * */
 
-static u32 hash_comm(const char *comm)
-{
-    /* hash su 16 byte circa */
+static u32 hash_comm(const char *comm) {
+    /* hash on 16 byte */
     return jhash(comm, strnlen(comm, SCTH_MAX_PROG_LEN), 0);
 }
 
-static bool prog_is_registered(const char *comm)
-{
+static bool prog_is_registered(const char *comm) {
     struct prog_ent *e;
     u32 h = hash_comm(comm);
 
@@ -117,8 +119,7 @@ static bool prog_is_registered(const char *comm)
     return false;
 }
 
-static bool uid_is_registered(u32 euid)
-{
+static bool uid_is_registered(u32 euid) {
     struct uid_ent *e;
     u32 h = jhash(&euid, sizeof(euid), 0);
 
@@ -129,8 +130,7 @@ static bool uid_is_registered(u32 euid)
     return false;
 }
 
-static bool sys_is_registered(u32 nr)
-{
+static bool sys_is_registered(u32 nr) {
     struct sys_ent *e;
     u32 h = jhash(&nr, sizeof(nr), 0);
 
@@ -141,19 +141,18 @@ static bool sys_is_registered(u32 nr)
     return false;
 }
 
-/* root-only update come richiesto :contentReference[oaicite:3]{index=3} */
-static bool caller_is_root(void)
-{
+/* root-only update :contentReference[oaicite:3]{index=3} */
+static bool caller_is_root(void) {
     return (from_kuid(&init_user_ns, current_euid()) == 0);
 }
 
-/* -----------------------------
- * Throttle (busy wait)
- * ----------------------------- */
+/* *****************************
+ * Throttle, busy wait
+ * *****************************
+ *  */
 
-static void sample_window_stats_locked(void)
-{
-    /* chiamata quando si “ruota” finestra */
+static void sample_window_stats_locked(void) {
+    /* called when the window is “rotated” */
     u32 b = (u32)atomic_read(&blocked_now);
     sum_blocked += b;
     n_windows++;
@@ -162,9 +161,8 @@ static void sample_window_stats_locked(void)
         peak_blocked = b;
 }
 
-/* helper: aggiorna peak delay in modo consistente */
-static void update_peak_delay(const char *comm, u32 euid, u64 delay_ns)
-{
+/* helper: update peak delay consistently */
+static void update_peak_delay(const char *comm, u32 euid, u64 delay_ns) {
     unsigned long flags;
 
     spin_lock_irqsave(&cfg_lock, flags);
@@ -182,21 +180,21 @@ static inline void apply_deferred_max_locked(void)
     /*Last update wins because g_max_next is overwritten; 
     deferred because only copied at each epoch boundary*/
 
-    /* chiamare SOLO sotto cfg_lock */
+    /* call only under cfg_lock */
     if (g_max_current != g_max_next)
         g_max_current = g_max_next;
 }
 
-/* rollover epoca: chiamare solo sotto cfg_lock */
+/* rollover era: call only under cfg_lock */
 static void epoch_rollover_locked(u64 now_ns)
 {
-    /* statistiche finestra */
+    /* window statistics */
     sample_window_stats_locked();
 
-    /* deferred max: diventa attivo dalla prossima epoca */
+    /* deferred max: takes effect from the next epoch */
     apply_deferred_max_locked();
 
-    /* mode 0/1: reset contatore finestra */
+    /* mode 0/1: reset window counter */
     win_start_ns = now_ns;
     win_count = 0;
 
@@ -205,11 +203,11 @@ static void epoch_rollover_locked(u64 now_ns)
     atomic_set(&g_tokens, (int)max_t(u32, 1, g_max_current));
 }
 
-/* timer wall-clock: scatta ogni 1s indipendentemente dal traffico */
-static enum hrtimer_restart epoch_timer_cb(struct hrtimer *t)
-{
+/* Wall-clock timer: triggers every 1 second regardless of traffic */
+static enum hrtimer_restart epoch_timer_cb(struct hrtimer *t) {
     unsigned long flags;
-    u64 now_ns = ktime_get_ns(); /* usiamo monotonic per contatori interni */
+    /* use monotonic for internal counters */
+    u64 now_ns = ktime_get_ns(); 
 
     spin_lock_irqsave(&cfg_lock, flags);
     if (READ_ONCE(g_monitor_on)) {
@@ -222,11 +220,10 @@ static enum hrtimer_restart epoch_timer_cb(struct hrtimer *t)
 }
 
 /*
- * MODE 0: baseline (quello che avevi già)
- * lock + polling frequente (ktime_get_ns ad ogni giro)
+ * MODE 0: baseline 
+ * lock + frequent polling, ktime_get_ns on every iteration
  */
-static void throttle_baseline(const char *comm, u32 euid, u64 now_ns)
-{
+static void throttle_baseline(const char *comm, u32 euid, u64 now_ns) {
     u64 local_start = 0;
     bool counted = false;
     u32 local_max;
@@ -244,7 +241,7 @@ static void throttle_baseline(const char *comm, u32 euid, u64 now_ns)
 
         spin_lock_irqsave(&cfg_lock, flags);
 
-        /* epoch_id è win_start_ns aggiornato dal timer */
+        /* epoch_id is win_start_ns updated by the timer */
         epoch_id = win_start_ns;
 
         if (win_count < local_max) {
@@ -257,11 +254,11 @@ static void throttle_baseline(const char *comm, u32 euid, u64 now_ns)
         if (counted)
             break;
 
-        /* oltre MAX: blocco fino al cambio epoca */
+        /* beyond MAX: blocked until the epoch changes */
         if (local_start == 0) {
             local_start = now_ns;
             atomic_inc(&blocked_now);
-            /* peak_blocked conservativo */
+            /* conservative peak_blocked */
             {
                 u32 b = (u32)atomic_read(&blocked_now);
                 if (b > READ_ONCE(peak_blocked))
@@ -272,12 +269,12 @@ static void throttle_baseline(const char *comm, u32 euid, u64 now_ns)
         if (!READ_ONCE(g_monitor_on))
             break;
 
-        /* attendo cambio epoca: win_start_ns deve cambiare */
+        /* waiting era change: win_start_ns must be updated */
         while (READ_ONCE(g_monitor_on) && READ_ONCE(win_start_ns) == epoch_id) {
             cpu_relax();
         }
 
-        /* nuova epoca: aggiorna max locale e riprova */
+        /* new epoch: update local max and try again */
         local_max = READ_ONCE(g_max_current);
         if (local_max == 0)
             local_max = 1;
@@ -291,12 +288,11 @@ static void throttle_baseline(const char *comm, u32 euid, u64 now_ns)
 }
 
 /*
- * MODE 1: backoff progressivo
- * - calcola deadline della finestra una volta
- * - riduce i ktime_get_ns (polling raro con step crescente)
+ * MODE 1: progressive backoff
+ * - calculates the window deadline once
+ * - reduces the number of ktime_get_ns calls, infrequent polling with increasing intervals
  */
-static void throttle_backoff(const char *comm, u32 euid, u64 now_ns)
-{
+static void throttle_backoff(const char *comm, u32 euid, u64 now_ns) {
     u64 local_start = 0;
     bool counted = false;
     u32 local_max;
@@ -332,7 +328,7 @@ static void throttle_backoff(const char *comm, u32 euid, u64 now_ns)
         if (!READ_ONCE(g_monitor_on))
             break;
 
-        /* backoff: relax + check più rado */
+        /* backoff: relax + less frequent checks */
         {
             unsigned int step = 64;
             while (READ_ONCE(g_monitor_on) && READ_ONCE(win_start_ns) == epoch_id) {
@@ -358,12 +354,11 @@ static void throttle_backoff(const char *comm, u32 euid, u64 now_ns)
 
 /*
  * MODE 2: atomic tokens
- * - fast path senza lock: atomic_dec_if_positive(&g_tokens)
- * - lock solo quando cambia secondo (rollover)
- * - attesa con backoff fino al prossimo secondo
+ * - lock-free fast path: atomic_dec_if_positive(&g_tokens)
+ * - lock only when the second changes (rollover)
+ * - wait with backoff until the next second
  */
-static void throttle_atomic_tokens(const char *comm, u32 euid, u64 now_ns)
-{
+static void throttle_atomic_tokens(const char *comm, u32 euid, u64 now_ns) {
     u64 local_start = 0;
     u64 epoch_sec;
 
@@ -379,7 +374,7 @@ static void throttle_atomic_tokens(const char *comm, u32 euid, u64 now_ns)
 
     epoch_sec = READ_ONCE(g_epoch_sec);
 
-    /* attendo cambio epoca: g_epoch_sec viene aggiornato dal timer */
+    /* waiting for epoch change: g_epoch_sec is updated by the timer */
     {
         unsigned int step = 64;
         while (READ_ONCE(g_monitor_on) && READ_ONCE(g_epoch_sec) == epoch_sec) {
@@ -391,10 +386,10 @@ static void throttle_atomic_tokens(const char *comm, u32 euid, u64 now_ns)
         }
     }
 
-    /* riprova dopo nuovo reset token */
+    /* Try again after resetting the token */
     now_ns = ktime_get_ns();
     if (READ_ONCE(g_monitor_on)) {
-        /* potrebbe ancora essere negativo per race: riprova finché passa o monitor off */
+        /* This might still be a race condition: keep trying until it succeeds or the monitor is turned off */
         while (READ_ONCE(g_monitor_on) && atomic_dec_if_positive(&g_tokens) < 0) {
             epoch_sec = READ_ONCE(g_epoch_sec);
             {
@@ -415,27 +410,23 @@ static void throttle_atomic_tokens(const char *comm, u32 euid, u64 now_ns)
     update_peak_delay(comm, euid, now_ns - local_start);
 }
 
-/* Wrapper: sceglie modalità */
-static void throttle_if_needed(const char *comm, u32 euid, u64 now_ns)
-{
+/* Wrapper: selects mode */
+static void throttle_if_needed(const char *comm, u32 euid, u64 now_ns) {
     u32 mode = READ_ONCE(g_mode);
 
-    if (mode == 2)
-        throttle_atomic_tokens(comm, euid, now_ns);
-    else if (mode == 1)
-        throttle_backoff(comm, euid, now_ns);
-    else
-        throttle_baseline(comm, euid, now_ns);
+    if (mode == 2)              throttle_atomic_tokens(comm, euid, now_ns);
+    else if (mode == 1)         throttle_backoff(comm, euid, now_ns);
+    else                        throttle_baseline(comm, euid, now_ns);
 }
 
-/* -----------------------------
- * kprobe: hook su do_syscall_64 (x86-64)
- * ----------------------------- */
+/* ********************************
+ * kprobe: hook su do_syscall_64, x86-64
+ * ********************************
+ *  */
 
 static struct kprobe kp;
 
-static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
-{
+static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs) {
 #ifdef CONFIG_X86_64
     struct pt_regs *sys_regs;
     u32 nr = 0;
@@ -445,35 +436,35 @@ static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
     u64 now_ns;
 
     /*
-     * Per ABI x86_64:
+     * For x86_64 ABI:
      *  arg1 -> RDI
      *  arg2 -> RSI
      *
-     * In molte build, x64_sys_call riceve (struct pt_regs *regs, unsigned int nr),
-     * quindi il numero syscall è spesso in RSI. In alternativa lo recuperiamo da orig_ax
-     * del pt_regs passato in RDI (fallback) ma solo se il puntatore è nello stack corrente.
+     * In many builds, x64_sys_call takes (struct pt_regs *regs, unsigned int nr),
+     * so the syscall number is often in RSI. Alternatively, we retrieve it from orig_ax
+     * of the pt_regs passed in RDI (fallback) but only if the pointer is on the current stack.
      */
 
-    /* Tentativo 1: nr come secondo argomento */
+    /* Attempt 1: nr as the second argument */
     nr = (u32)regs->si;
 
-    /* Tentativo 2 (fallback): pt_regs* in RDI e nr = orig_ax */
+    /* Attempt 2 (fallback): pt_regs* in RDI and nr = orig_ax */
     sys_regs = (struct pt_regs *)regs->di;
     if (sys_regs) {
         unsigned long sp = (unsigned long)sys_regs;
         unsigned long base = (unsigned long)task_stack_page(current);
 
-        /* Dereferenzia sys_regs solo se sta nello stack del task corrente */
+        /* Dereference sys_regs only if it is on the current task's stack */
         if (sp >= base && sp < base + THREAD_SIZE) {
             u32 ax = (u32)sys_regs->orig_ax;
 
-            /* Se nr da RSI non è plausibile, usa orig_ax */
-            if (nr > 1024)  /* soglia “sanity” (x86_64 syscall <= ~600) */
+            /* If the RSI value is implausible, use orig_ax */
+            if (nr > 1024)  /* “sanity” threshold (x86_64 syscall ≤ ~600) */
                 nr = ax;
         }
     }
 
-    /* Se ancora non plausibile, esci presto */
+    /* If it's still not plausible, exit early */
     if (nr > 4096)
         return 0;
 
@@ -497,12 +488,11 @@ static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 }
 
 
-/* -----------------------------
+/* *****************************
  * ioctl + device
- * ----------------------------- */
+ * ***************************** */
 
-static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
-{
+static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
     unsigned long flags;
     int ret = 0;
 
@@ -533,21 +523,31 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
     case SCTH_IOC_ADD_PROG: {
         struct scth_prog_req req;
         struct prog_ent *e;
-        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { 
+            ret = -EFAULT; 
+            break; 
+        }
         req.name[SCTH_MAX_PROG_LEN-1] = '\0';
         if (prog_is_registered(req.name)) break;
         e = kzalloc(sizeof(*e), GFP_ATOMIC);
-        if (!e) { ret = -ENOMEM; break; }
+        if (!e) { 
+            ret = -ENOMEM; 
+            break; 
+        }
         strncpy(e->name, req.name, SCTH_MAX_PROG_LEN);
         e->h = hash_comm(e->name);
         hash_add(prog_ht, &e->node, e->h);
         break;
     }
+
     case SCTH_IOC_DEL_PROG: {
         struct scth_prog_req req;
         struct prog_ent *e;
         u32 h;
-        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { 
+            ret = -EFAULT; 
+            break; 
+        }
         req.name[SCTH_MAX_PROG_LEN-1] = '\0';
         h = hash_comm(req.name);
         hash_for_each_possible(prog_ht, e, node, h) {
@@ -559,11 +559,15 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         }
         break;
     }
+
     case SCTH_IOC_ADD_UID: {
         struct scth_uid_req req;
         struct uid_ent *e;
         u32 h;
-        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { 
+            ret = -EFAULT; 
+            break; 
+        }
         if (uid_is_registered(req.euid)) break;
         e = kzalloc(sizeof(*e), GFP_ATOMIC);
         if (!e) { ret = -ENOMEM; break; }
@@ -573,11 +577,15 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         hash_add(uid_ht, &e->node, e->h);
         break;
     }
+
     case SCTH_IOC_DEL_UID: {
         struct scth_uid_req req;
         struct uid_ent *e;
         u32 h;
-        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { 
+            ret = -EFAULT; 
+            break; 
+        }
         h = jhash(&req.euid, sizeof(req.euid), 0);
         hash_for_each_possible(uid_ht, e, node, h) {
             if (e->euid == req.euid) {
@@ -588,11 +596,15 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         }
         break;
     }
+
     case SCTH_IOC_ADD_SYSCALL: {
         struct scth_sys_req req;
         struct sys_ent *e;
         u32 h;
-        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { 
+            ret = -EFAULT; 
+            break; 
+        }
         if (sys_is_registered(req.nr)) break;
         e = kzalloc(sizeof(*e), GFP_ATOMIC);
         if (!e) { ret = -ENOMEM; break; }
@@ -602,11 +614,15 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         hash_add(sys_ht, &e->node, e->h);
         break;
     }
+
     case SCTH_IOC_DEL_SYSCALL: {
         struct scth_sys_req req;
         struct sys_ent *e;
         u32 h;
-        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { 
+            ret = -EFAULT; 
+            break; 
+        }
         h = jhash(&req.nr, sizeof(req.nr), 0);
         hash_for_each_possible(sys_ht, e, node, h) {
             if (e->nr == req.nr) {
@@ -617,12 +633,17 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         }
         break;
     }
+
     case SCTH_IOC_SET_MAX: {
         struct scth_max_req req;
-        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { 
+            ret = -EFAULT; 
+            break; 
+        }
         g_max_next = (req.max_per_sec == 0 ? 1 : req.max_per_sec);
         break;
     }
+
     case SCTH_IOC_MON_ON:
         g_monitor_on = true;
 
@@ -634,6 +655,7 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             hrtimer_start(&epoch_timer, ktime_set(1, 0), HRTIMER_MODE_REL);
         }
         break;
+    
     case SCTH_IOC_MON_OFF:
         g_monitor_on = false;
 
@@ -650,7 +672,10 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         struct scth_list_resp lr;
         u32 cap, out = 0;
 
-        if (copy_from_user(&lr, (void __user *)arg, sizeof(lr))) { ret = -EFAULT; break; }
+        if (copy_from_user(&lr, (void __user *)arg, sizeof(lr))) { 
+            ret = -EFAULT; 
+            break; 
+        }
         cap = lr.count;
         if (cap > SCTH_MAX_LIST) cap = SCTH_MAX_LIST;
         if (lr.ptr == 0) { ret = -EINVAL; break; }
@@ -670,7 +695,10 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             u32 __user *ubuf = (u32 __user *)(uintptr_t)lr.ptr;
             hash_for_each(uid_ht, b, e, node) {
                 if (out >= cap) break;
-                if (put_user(e->euid, &ubuf[out])) { ret = -EFAULT; break; }
+                if (put_user(e->euid, &ubuf[out])) { 
+                    ret = -EFAULT; 
+                    break; 
+                }
                 out++;
             }
         } else {
@@ -679,7 +707,10 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             u32 __user *ubuf = (u32 __user *)(uintptr_t)lr.ptr;
             hash_for_each(sys_ht, b, e, node) {
                 if (out >= cap) break;
-                if (put_user(e->nr, &ubuf[out])) { ret = -EFAULT; break; }
+                if (put_user(e->nr, &ubuf[out])) { 
+                    ret = -EFAULT; 
+                    break; 
+                }
                 out++;
             }
         }
@@ -722,7 +753,7 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
         g_max_current = g_max_next;
 
-        /* reset finestra */
+        /* reset window */
         win_start_ns = 0;
         win_count = 0;
         atomic_set(&blocked_now, 0);
@@ -735,10 +766,16 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
     case SCTH_IOC_SET_MODE: {
         struct scth_mode_req req;
-        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
-        if (req.mode > 2) { ret = -EINVAL; break; }
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { 
+            ret = -EFAULT; 
+            break; 
+        }
+        if (req.mode > 2) { 
+            ret = -EINVAL; 
+            break; 
+        }
         g_mode = req.mode;
-        /* reset token state quando cambio mode */
+        /* Reset token state when changing mode */
         atomic_set(&g_tokens, 0);
         g_epoch_sec = 0;
         break;
@@ -761,40 +798,46 @@ static const struct file_operations scth_fops = {
 #endif
 };
 
+/* Open to all; but updates are root-only: contentReference[oaicite:7]{index=7} */
 static struct miscdevice scth_dev = {
     .minor = MISC_DYNAMIC_MINOR,
     .name  = "scth",
     .fops  = &scth_fops,
-    .mode  = 0666, /* aperto a tutti; ma update root-only come richiesto :contentReference[oaicite:7]{index=7} */
+    .mode  = 0666, 
 };
 
 /* cleanup helpers */
-static void free_hashtable_prog(void)
-{
+static void free_hashtable_prog(void) {
     struct prog_ent *e;
     struct hlist_node *tmp;
     int b;
-    hash_for_each_safe(prog_ht, b, tmp, e, node) { hash_del(&e->node); kfree(e); }
+    hash_for_each_safe(prog_ht, b, tmp, e, node) { 
+        hash_del(&e->node); 
+        kfree(e); 
+    }
 }
 
-static void free_hashtable_uid(void)
-{
+static void free_hashtable_uid(void) {
     struct uid_ent *e;
     struct hlist_node *tmp;
     int b;
-    hash_for_each_safe(uid_ht, b, tmp, e, node) { hash_del(&e->node); kfree(e); }
+    hash_for_each_safe(uid_ht, b, tmp, e, node) { 
+        hash_del(&e->node); 
+        kfree(e); 
+    }
 }
 
-static void free_hashtable_sys(void)
-{
+static void free_hashtable_sys(void) {
     struct sys_ent *e;
     struct hlist_node *tmp;
     int b;
-    hash_for_each_safe(sys_ht, b, tmp, e, node) { hash_del(&e->node); kfree(e); }
+    hash_for_each_safe(sys_ht, b, tmp, e, node) { 
+        hash_del(&e->node); 
+        kfree(e); 
+    }
 }
 
-static int __init scth_init(void)
-{
+static int __init scth_init(void) {
     int ret;
 
     hash_init(prog_ht);
@@ -807,7 +850,7 @@ static int __init scth_init(void)
 
     ret = misc_register(&scth_dev);
     if (ret) {
-        pr_err("scth: misc_register failed: %d\n", ret);
+        printk("scth: misc_register failed: %d\n", ret);
         return ret;
     }
 
@@ -818,17 +861,16 @@ static int __init scth_init(void)
 
     ret = register_kprobe(&kp);
     if (ret) {
-        pr_err("scth: register_kprobe failed: %d\n", ret);
+        printk("scth: register_kprobe failed: %d\n", ret);
         misc_deregister(&scth_dev);
         return ret;
     }
 
-    pr_info("scth: loaded (/dev/%s). monitor_off, MAXcur=%u MAXnext=%u mode=%u\n", scth_dev.name, g_max_current, g_max_next, g_mode);
+    printk("scth: loaded (/dev/%s). monitor_off, MAXcur=%u MAXnext=%u mode=%u\n", scth_dev.name, g_max_current, g_max_next, g_mode);
     return 0;
 }
 
-static void __exit scth_exit(void)
-{
+static void __exit scth_exit(void) {
 
     if (atomic_cmpxchg(&epoch_timer_on, 1, 0) == 1)
         hrtimer_cancel(&epoch_timer);
@@ -840,7 +882,7 @@ static void __exit scth_exit(void)
     free_hashtable_uid();
     free_hashtable_sys();
 
-    pr_info("scth: unloaded\n");
+    printk("scth: unloaded\n");
 }
 
 module_init(scth_init);

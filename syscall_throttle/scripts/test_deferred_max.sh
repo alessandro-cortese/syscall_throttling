@@ -4,7 +4,7 @@ cd "$(dirname "$0")/.."
 
 echo "[*] Setup base"
 ./scripts/setup_test_env.sh >/dev/null
-sudo ./user/scthctl setmode 2   # prova con MODE 2; ripeti con 0/1 se vuoi
+sudo ./user/scthctl setmode 2   # MODE 2
 sudo ./user/scthctl resetstats
 
 echo "[*] Start tester"
@@ -12,21 +12,21 @@ echo "[*] Start tester"
 pid=$!
 sleep 1
 
-echo "[*] stats (prima):"
+echo "[*] stats (before):"
 ./user/scthctl stats
 
-echo "[*] Set MAX più volte nella stessa epoca (deve valere solo l'ultimo, ma dalla prossima epoca)"
+echo "[*] MAX has been set multiple times within the same epoch (only the last setting should apply, but from the next epoch onwards)"
 sudo ./user/scthctl setmax 10
 sudo ./user/scthctl setmax 20
 sudo ./user/scthctl setmax 5000
 
-echo "[*] stats subito dopo setmax multipli (max_next deve essere 5000; max_current ancora vecchio finché non scatta rollover):"
+echo "[*] Stats immediately after setting the maximum number of multiples (max_next must be 5000; max_current remains the old value until the rollover takes effect):"
 ./user/scthctl stats
 
-echo "[*] Attendo 2 secondi per superare almeno un rollover..."
+echo "[*] I'll wait 2 seconds to get past at least one rollover..."
 sleep 2
 
-echo "[*] stats dopo rollover (max_current dovrebbe diventare 5000):"
+echo "[*] stats after rollover (max_current should become 5000):"
 ./user/scthctl stats
 
 kill "$pid" 2>/dev/null || true

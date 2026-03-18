@@ -37,9 +37,10 @@ static unsigned long scth_cr0, scth_cr4;
 static struct hrtimer epoch_timer;
 static atomic_t epoch_timer_on = ATOMIC_INIT(0);
 
-/* -----------------------------
+/* *******************************
  * Hash sets: prog / uid / syscall
- * ----------------------------- */
+ * *******************************
+ * */
 
 static bool prog_is_registered(const char *comm);
 static bool uid_is_registered(u32 euid);
@@ -68,26 +69,27 @@ static DEFINE_HASHTABLE(prog_ht, HT_BITS);
 static DEFINE_HASHTABLE(uid_ht,  HT_BITS);
 static DEFINE_HASHTABLE(sys_ht,  HT_BITS);
 
-static DEFINE_SPINLOCK(cfg_lock); /* protegge hash tables + monitor config */
+static DEFINE_SPINLOCK(cfg_lock); /* protects hash tables and configuration files */
 
-/* -----------------------------
+/* *****************************
  * Monitor state + stats
- * ----------------------------- */
+ * *****************************
+ *  */
 
-/* configurazione */
+/* config */
 static u32 g_max_current = 100;
 static u32 g_max_next = 100;
 static bool g_monitor_on = false;
 
-/* finestra 1s */
+/* 1s window */
 static u64 win_start_ns = 0;
 static u32 win_count = 0;
 
-/* contatori thread bloccati (busy wait) */
+/* blocked thread counters, busy wait */
 static atomic_t blocked_now = ATOMIC_INIT(0);
 static u32 peak_blocked = 0;
 
-/* campionamento per "avg blocked threads" */
+/* sampling for ‘avg blocked threads’ */
 static u64 sum_blocked = 0;
 static u64 n_windows = 0;
 
@@ -96,12 +98,13 @@ static u64 peak_delay_ns = 0;
 static char peak_prog[SCTH_MAX_PROG_LEN] = {0};
 static u32  peak_uid = 0;
 
-/* -----------------------------
+/* ***************************************
  * USCTM integration: syscall table hook
- * ----------------------------- */
+ * *************************************** 
+ * */
 
-static void **sys_call_table = NULL;          /* impostato via ioctl */
-static DEFINE_MUTEX(hook_mutex);              /* serializza install/uninstall hook */
+static void **sys_call_table = NULL;          
+static DEFINE_MUTEX(hook_mutex);              /* serialise install/uninstall hook */
 static DEFINE_SPINLOCK(hook_lock);
 
 typedef asmlinkage long (*sys_fn_t)(const struct pt_regs *);
@@ -114,43 +117,39 @@ struct hook_ent {
 
 static DEFINE_HASHTABLE(hook_ht, HT_BITS);
 
-/* -----------------------------
+/* *****************************
  * Sleeping throttle support
- * ----------------------------- */
+ * *****************************
+ *  */
 
 static wait_queue_head_t epoch_wq;
 static atomic64_t epoch_id = ATOMIC64_INIT(0);
 
-static inline void scth_write_cr0_forced(unsigned long val)
-{
+static inline void scth_write_cr0_forced(unsigned long val) {
     unsigned long __force_order;
     asm volatile("mov %0, %%cr0" : "+r"(val), "+m"(__force_order));
 }
 
-static inline void scth_write_cr4_forced(unsigned long val)
-{
+static inline void scth_write_cr4_forced(unsigned long val) {
     unsigned long __force_order;
     asm volatile("mov %0, %%cr4" : "+r"(val), "+m"(__force_order));
 }
 
-static inline void scth_conditional_cet_disable(void)
-{
+static inline void scth_conditional_cet_disable(void) {
 #ifdef X86_CR4_CET
     if (scth_cr4 & X86_CR4_CET)
         scth_write_cr4_forced(scth_cr4 & ~X86_CR4_CET);
 #endif
 }
 
-static inline void scth_conditional_cet_enable(void)
-{
+static inline void scth_conditional_cet_enable(void) {
 #ifdef X86_CR4_CET
     if (scth_cr4 & X86_CR4_CET)
         scth_write_cr4_forced(scth_cr4);
 #endif
 }
 
-static inline void scth_begin_syscall_table_patch(void)
-{
+static inline void scth_begin_syscall_table_patch(void) {
     preempt_disable();
     barrier();
     scth_cr0 = read_cr0();
@@ -160,8 +159,7 @@ static inline void scth_begin_syscall_table_patch(void)
     barrier();
 }
 
-static inline void scth_end_syscall_table_patch(void)
-{
+static inline void scth_end_syscall_table_patch(void) {
     barrier();
     scth_write_cr0_forced(scth_cr0);              /* restore WP */
     scth_conditional_cet_enable();
@@ -169,9 +167,8 @@ static inline void scth_end_syscall_table_patch(void)
     preempt_enable();
 }
 
-/* scrive sys_call_table[nr] = fn in modo safe; WP/CET gestiti dal chiamante */
-static int scth_write_sct_entry(u32 nr, void *fn)
-{
+/* write sys_call_table[nr] = fn in safe mode; WP/CET handled by caller */
+static int scth_write_sct_entry(u32 nr, void *fn) {
     if (!sys_call_table)
         return -EINVAL;
 
@@ -179,8 +176,7 @@ static int scth_write_sct_entry(u32 nr, void *fn)
     return 0;
 }
 
-static sys_fn_t hook_get_orig(u32 nr)
-{
+static sys_fn_t hook_get_orig(u32 nr) {
     struct hook_ent *e;
     sys_fn_t out = NULL;
     u32 h = jhash(&nr, sizeof(nr), 0);
@@ -197,13 +193,11 @@ static sys_fn_t hook_get_orig(u32 nr)
     return out;
 }
 
-static bool hook_is_installed(u32 nr)
-{
+static bool hook_is_installed(u32 nr) {
     return hook_get_orig(nr) != NULL;
 }
 
-static bool match_request(u32 nr, const char *comm, u32 euid)
-{
+static bool match_request(u32 nr, const char *comm, u32 euid) {
     bool match = false;
 
     spin_lock(&cfg_lock);
@@ -214,9 +208,8 @@ static bool match_request(u32 nr, const char *comm, u32 euid)
     return match;
 }
 
-/* throttle: consuma budget globale per epoca; se finito, dorme fino a tick */
-static void throttle_sleeping(const char *comm, u32 euid, u64 now_ns)
-{
+/* throttle: consumes the global budget per epoch; if exhausted, sleeps until the next tick */
+static void throttle_sleeping(const char *comm, u32 euid, u64 now_ns) {
     u64 local_start = 0;
 
     if (!READ_ONCE(g_monitor_on))
@@ -257,7 +250,7 @@ static void throttle_sleeping(const char *comm, u32 euid, u64 now_ns)
         {
             u64 my_epoch = atomic64_read(&epoch_id);
             int wret = wait_event_killable(epoch_wq, (!READ_ONCE(g_monitor_on)) || (atomic64_read(&epoch_id) != my_epoch));
-            if (wret) { /* segnale ricevuto (es. SIGKILL) */
+            if (wret) { /* signal received (e.g. SIGKILL) */
                 break;
             }
         }
@@ -274,8 +267,7 @@ static void throttle_sleeping(const char *comm, u32 euid, u64 now_ns)
     }
 }
 
-static asmlinkage long scth_stub(const struct pt_regs *regs)
-{
+static asmlinkage long scth_stub(const struct pt_regs *regs) {
     u32 nr;
     u32 euid;
     char comm[SCTH_MAX_PROG_LEN];
@@ -289,7 +281,7 @@ static asmlinkage long scth_stub(const struct pt_regs *regs)
     euid = (u32)from_kuid(&init_user_ns, current_euid());
     get_task_comm(comm, current);
 
-    /* chiamata originale */
+    /* call */
     orig = hook_get_orig(nr);
     if (!orig)
         return -ENOSYS;
@@ -303,8 +295,7 @@ static asmlinkage long scth_stub(const struct pt_regs *regs)
     return orig(regs);
 }
 
-static int install_hook(u32 nr)
-{
+static int install_hook(u32 nr) {
     struct hook_ent *he;
     sys_fn_t cur;
     u32 h;
@@ -313,7 +304,7 @@ static int install_hook(u32 nr)
     if (!sys_call_table)
         return -EINVAL;
 
-    /* già installato? */
+    /* already installed? */
     if (hook_is_installed(nr))
         return 0;
 
@@ -330,8 +321,8 @@ static int install_hook(u32 nr)
     h = jhash(&nr, sizeof(nr), 0);
 
     /*
-     * 1) Patch sys_call_table PRIMA di rendere visibile l’entry in hook_ht
-     *    (così lo stub non può mai vedere orig “registrata” ma entry non patchata)
+     * 1) Patch the sys_call_table BEFORE making the entry visible in hook_ht
+     *    so that the stub never sees the “registered” original but the unpatched entry
      */
     scth_begin_syscall_table_patch();
     ret = scth_write_sct_entry(nr, (void *)scth_stub);
@@ -342,8 +333,8 @@ static int install_hook(u32 nr)
     scth_end_syscall_table_patch();
 
     /*
-     * 2) Ora pubblica l’entry in hook_ht sotto hook_lock.
-     *    Ricontrollo: se qualcuno l’ha installato nel frattempo, rollback e torna.
+     * 2) Now publish the entry in hook_ht under hook_lock.
+     *    Check again: if someone has installed it in the meantime, roll back and try again.
      */
     spin_lock(&hook_lock);
     {
@@ -376,8 +367,7 @@ static int install_hook(u32 nr)
     return 0;
 }
 
-static int remove_hook(u32 nr)
-{
+static int remove_hook(u32 nr) {
     struct hook_ent *he;
     struct hlist_node *tmp;
     u32 h;
@@ -389,7 +379,7 @@ static int remove_hook(u32 nr)
 
     h = jhash(&nr, sizeof(nr), 0);
 
-    /* 1) trova e stacca da hook_ht sotto lock */
+    /* 1) Find and unhook from hook_ht under lock */
     spin_lock(&hook_lock);
     hash_for_each_possible_safe(hook_ht, he, tmp, node, h) {
         if (he->nr == nr) {
@@ -397,11 +387,11 @@ static int remove_hook(u32 nr)
             hash_del(&he->node);
             spin_unlock(&hook_lock);
 
-            /* 2) ripristina la sys_call_table FUORI dallo spinlock */
+            /* 2) Restore the sys_call_table OUTSIDE the spinlock */
             scth_begin_syscall_table_patch();
             ret = scth_write_sct_entry(nr, (void *)orig);
             if (ret)
-                pr_err("scth: failed restoring sys_call_table[%u]\n", nr);
+                printk("scth: failed restoring sys_call_table[%u]\n", nr);
             scth_end_syscall_table_patch();
 
             kfree(he);
@@ -413,8 +403,7 @@ static int remove_hook(u32 nr)
     return -ENOENT;
 }
 
-static void remove_all_hooks(void)
-{
+static void remove_all_hooks(void) {
     struct hook_ent *he;
     struct hlist_node *tmp;
     int b;
@@ -427,24 +416,25 @@ static void remove_all_hooks(void)
             u32 nr;
             sys_fn_t orig;
 
-            /* 1) prendi un elemento e staccalo dalla lista sotto spinlock */
+            /* 1) Take an element and remove it from the list under a spinlock */
             spin_lock(&hook_lock);
 
             he = NULL;
             hlist_for_each_entry_safe(he, tmp, &hook_ht[b], node) {
                 hlist_del(&he->node);
-                break; /* staccato il primo, esci */
+                /* The first one breaks away and leaves */
+                break; 
             }
 
             spin_unlock(&hook_lock);
 
             if (!he)
-                break; /* bucket vuoto */
+                break; /* empty bucket */
 
             nr = he->nr;
             orig = he->orig;
 
-            /* 2) ripristina entry FUORI dallo spinlock */
+            /* 2) Restore the entry OUTSIDE the spinlock */
             scth_begin_syscall_table_patch();
             WRITE_ONCE(sys_call_table[nr], (void *)orig);
             scth_end_syscall_table_patch();
@@ -454,18 +444,17 @@ static void remove_all_hooks(void)
     }
 }
 
-/* -----------------------------
+/* *****************************
  * Helpers hashing / lookup
- * ----------------------------- */
+ * *****************************
+ *  */
 
-static u32 hash_comm(const char *comm)
-{
-    /* hash su 16 byte circa */
+static u32 hash_comm(const char *comm) {
+    /* hash on 16 byte */
     return jhash(comm, strnlen(comm, SCTH_MAX_PROG_LEN), 0);
 }
 
-static bool prog_is_registered(const char *comm)
-{
+static bool prog_is_registered(const char *comm) {
     struct prog_ent *e;
     u32 h = hash_comm(comm);
 
@@ -476,8 +465,7 @@ static bool prog_is_registered(const char *comm)
     return false;
 }
 
-static bool uid_is_registered(u32 euid)
-{
+static bool uid_is_registered(u32 euid) {
     struct uid_ent *e;
     u32 h = jhash(&euid, sizeof(euid), 0);
 
@@ -488,8 +476,7 @@ static bool uid_is_registered(u32 euid)
     return false;
 }
 
-static bool sys_is_registered(u32 nr)
-{
+static bool sys_is_registered(u32 nr) {
     struct sys_ent *e;
     u32 h = jhash(&nr, sizeof(nr), 0);
 
@@ -500,19 +487,18 @@ static bool sys_is_registered(u32 nr)
     return false;
 }
 
-/* root-only update come richiesto :contentReference[oaicite:3]{index=3} */
-static bool caller_is_root(void)
-{
+/* root-only update :contentReference[oaicite:3]{index=3} */
+static bool caller_is_root(void) {
     return (from_kuid(&init_user_ns, current_euid()) == 0);
 }
 
-/* -----------------------------
+/* *****************************
  * Throttle (busy wait)
- * ----------------------------- */
+ * *****************************
+ *  */
 
-static void sample_window_stats_locked(void)
-{
-    /* chiamata quando si “ruota” finestra */
+static void sample_window_stats_locked(void) {
+    /* called on window change */
     u32 b = (u32)atomic_read(&blocked_now);
     sum_blocked += b;
     n_windows++;
@@ -521,9 +507,8 @@ static void sample_window_stats_locked(void)
         peak_blocked = b;
 }
 
-/* helper: aggiorna peak delay in modo consistente */
-static void update_peak_delay(const char *comm, u32 euid, u64 delay_ns)
-{
+/* helper: update peak delay */ 
+static void update_peak_delay(const char *comm, u32 euid, u64 delay_ns) {
     unsigned long flags;
 
     spin_lock_irqsave(&cfg_lock, flags);
@@ -535,37 +520,35 @@ static void update_peak_delay(const char *comm, u32 euid, u64 delay_ns)
     spin_unlock_irqrestore(&cfg_lock, flags);
 }
 
-static inline void apply_deferred_max_locked(void)
-{
+static inline void apply_deferred_max_locked(void) {
 
     /*Last update wins because g_max_next is overwritten; 
     deferred because only copied at each epoch boundary*/
 
-    /* chiamare SOLO sotto cfg_lock */
+    /* call only under cfg_lock */
     if (g_max_current != g_max_next)
         g_max_current = g_max_next;
 }
 
-/* rollover epoca: chiamare solo sotto cfg_lock */
-static void epoch_rollover_locked(u64 now_ns)
-{
+/* rollover era: call only under cfg_lock */
+static void epoch_rollover_locked(u64 now_ns) {
     sample_window_stats_locked();
     apply_deferred_max_locked();
 
-    /* reset contatore finestra */
+    /* reset window counter */
     win_start_ns = now_ns;
     win_count = 0;
 
-    /* nuova epoca: sveglia thread sleeping */
+    /* new era: wake up sleeping thread */
     atomic64_inc(&epoch_id);
     wake_up_all(&epoch_wq);
 }
 
-/* timer wall-clock: scatta ogni 1s indipendentemente dal traffico */
-static enum hrtimer_restart epoch_timer_cb(struct hrtimer *t)
-{
+/* wall-clock timer: triggers every 1 second regardless of traffic */
+static enum hrtimer_restart epoch_timer_cb(struct hrtimer *t) {
     unsigned long flags;
-    u64 now_ns = ktime_get_ns(); /* usiamo monotonic per contatori interni */
+    /* monotonic for internal counter */
+    u64 now_ns = ktime_get_ns(); 
 
     spin_lock_irqsave(&cfg_lock, flags);
     if (READ_ONCE(g_monitor_on)) {
@@ -577,12 +560,12 @@ static enum hrtimer_restart epoch_timer_cb(struct hrtimer *t)
     return HRTIMER_RESTART;
 }
 
-/* -----------------------------
+/* ****************************
  * ioctl + device
- * ----------------------------- */
+ * *************************** 
+ * */
 
-static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
-{
+static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
     unsigned long flags;
     int ret = 0;
 
@@ -613,21 +596,31 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
     case SCTH_IOC_ADD_PROG: {
         struct scth_prog_req req;
         struct prog_ent *e;
-        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { 
+            ret = -EFAULT; 
+            break; 
+        }
         req.name[SCTH_MAX_PROG_LEN-1] = '\0';
         if (prog_is_registered(req.name)) break;
         e = kzalloc(sizeof(*e), GFP_ATOMIC);
-        if (!e) { ret = -ENOMEM; break; }
+        if (!e) { 
+            ret = -ENOMEM; 
+            break; 
+        }
         strncpy(e->name, req.name, SCTH_MAX_PROG_LEN);
         e->h = hash_comm(e->name);
         hash_add(prog_ht, &e->node, e->h);
         break;
     }
+
     case SCTH_IOC_DEL_PROG: {
         struct scth_prog_req req;
         struct prog_ent *e;
         u32 h;
-        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { 
+            ret = -EFAULT; 
+            break; 
+        }
         req.name[SCTH_MAX_PROG_LEN-1] = '\0';
         h = hash_comm(req.name);
         hash_for_each_possible(prog_ht, e, node, h) {
@@ -639,25 +632,36 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         }
         break;
     }
+    
     case SCTH_IOC_ADD_UID: {
         struct scth_uid_req req;
         struct uid_ent *e;
         u32 h;
-        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { 
+            ret = -EFAULT; 
+            break; 
+        }
         if (uid_is_registered(req.euid)) break;
         e = kzalloc(sizeof(*e), GFP_ATOMIC);
-        if (!e) { ret = -ENOMEM; break; }
+        if (!e) { 
+            ret = -ENOMEM; 
+            break; 
+        }
         e->euid = req.euid;
         h = jhash(&e->euid, sizeof(e->euid), 0);
         e->h = h;
         hash_add(uid_ht, &e->node, e->h);
         break;
     }
+    
     case SCTH_IOC_DEL_UID: {
         struct scth_uid_req req;
         struct uid_ent *e;
         u32 h;
-        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { 
+            ret = -EFAULT; 
+            break; 
+        }
         h = jhash(&req.euid, sizeof(req.euid), 0);
         hash_for_each_possible(uid_ht, e, node, h) {
             if (e->euid == req.euid) {
@@ -674,8 +678,14 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         struct sys_ent *e;
         u32 h;
 
-        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
-        if (!sys_call_table) { ret = -EINVAL; break; }
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { 
+            ret = -EFAULT; 
+            break; 
+        }
+        if (!sys_call_table) { 
+            ret = -EINVAL; 
+            break; 
+        }
         if (sys_is_registered(req.nr)) break;
 
         /* install hook FUORI dallo spinlock cfg_lock */
@@ -690,7 +700,10 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
         /* solo se hook ok, registra la syscall nella ht */
         e = kzalloc(sizeof(*e), GFP_ATOMIC);
-        if (!e) { ret = -ENOMEM; break; }
+        if (!e) { 
+            ret = -ENOMEM; 
+            break; 
+        }
         e->nr = req.nr;
         h = jhash(&e->nr, sizeof(e->nr), 0);
         e->h = h;
@@ -704,10 +717,16 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         struct sys_ent *e;
         u32 h;
 
-        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
-        if (!sys_call_table) { ret = -EINVAL; break; }
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { 
+            ret = -EFAULT; 
+            break; 
+        }
+        if (!sys_call_table) { 
+            ret = -EINVAL; 
+            break; 
+        }
 
-        /* rimuovi hook FUORI cfg_lock */
+        /* rimuove hook fuori cfg_lock */
         spin_unlock_irqrestore(&cfg_lock, flags);
         mutex_lock(&hook_mutex);
         ret = remove_hook(req.nr);
@@ -731,7 +750,10 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
     
     case SCTH_IOC_SET_MAX: {
         struct scth_max_req req;
-        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { ret = -EFAULT; break; }
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) { 
+            ret = -EFAULT; 
+            break; 
+        }
         g_max_next = (req.max_per_sec == 0 ? 1 : req.max_per_sec);
         break;
     }
@@ -742,7 +764,6 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         u64 now_ns_local = ktime_get_ns();
         epoch_rollover_locked(now_ns_local);
 
-        /* start timer una sola volta */
         if (atomic_cmpxchg(&epoch_timer_on, 0, 1) == 0) {
             hrtimer_start(&epoch_timer, ktime_set(1, 0), HRTIMER_MODE_REL);
         }
@@ -766,10 +787,16 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         struct scth_list_resp lr;
         u32 cap, out = 0;
 
-        if (copy_from_user(&lr, (void __user *)arg, sizeof(lr))) { ret = -EFAULT; break; }
+        if (copy_from_user(&lr, (void __user *)arg, sizeof(lr))) { 
+            ret = -EFAULT; 
+            break; 
+        }
         cap = lr.count;
         if (cap > SCTH_MAX_LIST) cap = SCTH_MAX_LIST;
-        if (lr.ptr == 0) { ret = -EINVAL; break; }
+        if (lr.ptr == 0) { 
+            ret = -EINVAL; 
+            break; 
+        }
 
         if (cmd == SCTH_IOC_LIST_PROG) {
             struct prog_ent *e;
@@ -777,7 +804,10 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             char __user *ubuf = (char __user *)(uintptr_t)lr.ptr;
             hash_for_each(prog_ht, b, e, node) {
                 if (out >= cap) break;
-                if (copy_to_user(ubuf + out*SCTH_MAX_PROG_LEN, e->name, SCTH_MAX_PROG_LEN)) { ret = -EFAULT; break; }
+                if (copy_to_user(ubuf + out*SCTH_MAX_PROG_LEN, e->name, SCTH_MAX_PROG_LEN)) { 
+                    ret = -EFAULT; 
+                    break; 
+                }
                 out++;
             }
         } else if (cmd == SCTH_IOC_LIST_UID) {
@@ -786,7 +816,10 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             u32 __user *ubuf = (u32 __user *)(uintptr_t)lr.ptr;
             hash_for_each(uid_ht, b, e, node) {
                 if (out >= cap) break;
-                if (put_user(e->euid, &ubuf[out])) { ret = -EFAULT; break; }
+                if (put_user(e->euid, &ubuf[out])) { 
+                    ret = -EFAULT; 
+                    break; 
+                }
                 out++;
             }
         } else {
@@ -795,7 +828,10 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             u32 __user *ubuf = (u32 __user *)(uintptr_t)lr.ptr;
             hash_for_each(sys_ht, b, e, node) {
                 if (out >= cap) break;
-                if (put_user(e->nr, &ubuf[out])) { ret = -EFAULT; break; }
+                if (put_user(e->nr, &ubuf[out])) { 
+                    ret = -EFAULT; 
+                    break; 
+                }
                 out++;
             }
         }
@@ -838,7 +874,7 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
         g_max_current = g_max_next;
 
-        /* reset finestra */
+        /* reset window */
         win_start_ns = 0;
         win_count = 0;
         atomic_set(&blocked_now, 0);
@@ -848,11 +884,11 @@ static long scth_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
     case SCTH_IOC_WAKE_WAITERS: {
         /*
-        * Sblocca eventuali thread addormentati nel throttle:
-        * - bump epoch_id => condizione (epoch_id != my_epoch) diventa vera
-        * - wake_up_all  => non aspettiamo il prossimo tick
+        * Wakes up any threads that have fallen asleep in the throttle:
+        * - bump epoch_id => the condition (epoch_id != my_epoch) becomes true
+        * - wake_up_all  => we do not wait for the next tick
         *
-        * NOTA: non modifica contatori/stats.
+        * NOTE: does not modify counters/stats.
         */
         atomic64_inc(&epoch_id);
         wake_up_all(&epoch_wq);
@@ -876,40 +912,46 @@ static const struct file_operations scth_fops = {
 #endif
 };
 
+/* open to all; but updates are restricted to root users: contentReference[oaicite:7]{index=7} */
 static struct miscdevice scth_dev = {
     .minor = MISC_DYNAMIC_MINOR,
     .name  = "scth",
     .fops  = &scth_fops,
-    .mode  = 0666, /* aperto a tutti; ma update root-only come richiesto :contentReference[oaicite:7]{index=7} */
+    .mode  = 0666, 
 };
 
 /* cleanup helpers */
-static void free_hashtable_prog(void)
-{
+static void free_hashtable_prog(void) {
     struct prog_ent *e;
     struct hlist_node *tmp;
     int b;
-    hash_for_each_safe(prog_ht, b, tmp, e, node) { hash_del(&e->node); kfree(e); }
+    hash_for_each_safe(prog_ht, b, tmp, e, node) { 
+        hash_del(&e->node); 
+        kfree(e); 
+    }
 }
 
-static void free_hashtable_uid(void)
-{
+static void free_hashtable_uid(void) {
     struct uid_ent *e;
     struct hlist_node *tmp;
     int b;
-    hash_for_each_safe(uid_ht, b, tmp, e, node) { hash_del(&e->node); kfree(e); }
+    hash_for_each_safe(uid_ht, b, tmp, e, node) { 
+        hash_del(&e->node); 
+        kfree(e); 
+    }
 }
 
-static void free_hashtable_sys(void)
-{
+static void free_hashtable_sys(void) {
     struct sys_ent *e;
     struct hlist_node *tmp;
     int b;
-    hash_for_each_safe(sys_ht, b, tmp, e, node) { hash_del(&e->node); kfree(e); }
+    hash_for_each_safe(sys_ht, b, tmp, e, node) { 
+        hash_del(&e->node); 
+        kfree(e); 
+    }
 }
 
-static int read_u64_from_sysfs(const char *path, u64 *out)
-{
+static int read_u64_from_sysfs(const char *path, u64 *out) {
     struct file *f;
     char buf[64];
     loff_t pos = 0;
@@ -931,7 +973,7 @@ static int read_u64_from_sysfs(const char *path, u64 *out)
 
     buf[n] = '\0';
 
-    /* il file contiene un numero decimale (u64) con newline */
+    /* The file contains a decimal number (u64) followed by a newline */
     if (kstrtoull(strim(buf), 10, &v) < 0)
         return -EINVAL;
 
@@ -939,8 +981,7 @@ static int read_u64_from_sysfs(const char *path, u64 *out)
     return 0;
 }
 
-static int __init scth_init(void)
-{
+static int __init scth_init(void) {
     int ret;
 
     hash_init(prog_ht);
@@ -957,7 +998,7 @@ static int __init scth_init(void)
 
     ret = misc_register(&scth_dev);
     if (ret) {
-        pr_err("scth: misc_register failed: %d\n", ret);
+        printk("scth: misc_register failed: %d\n", ret);
         return ret;
     }
 
@@ -970,24 +1011,23 @@ static int __init scth_init(void)
     }
 
     if (sys_call_table)
-        pr_info("scth: sys_call_table=%px (from usctm symbol_get)\n", sys_call_table);
+        printk("scth: sys_call_table=%px (from usctm symbol_get)\n", sys_call_table);
     else
-        pr_warn("scth: cannot get sys_call_table from usctm (symbol not found). Using sysfs/ioctl.\n");
+        printk("scth: cannot get sys_call_table from usctm (symbol not found). Using sysfs/ioctl.\n");
 
     if (!sys_call_table) {
         u64 addr = 0;
         if (read_u64_from_sysfs(USCTM_SYSFS_PATH, &addr) == 0 && addr) {
             sys_call_table = (void **)(uintptr_t)addr;
-            pr_info("scth: sys_call_table=%px (from sysfs fallback)\n", sys_call_table);
+            printk("scth: sys_call_table=%px (from sysfs fallback)\n", sys_call_table);
         }
     }
 
-    pr_info("scth: loaded (/dev/%s). monitor_off, MAXcur=%u MAXnext=%u\n", scth_dev.name, g_max_current, g_max_next);
+    printk("scth: loaded (/dev/%s). monitor_off, MAXcur=%u MAXnext=%u\n", scth_dev.name, g_max_current, g_max_next);
     return 0;
 }
 
-static void __exit scth_exit(void)
-{
+static void __exit scth_exit(void) {
 
     if (atomic_cmpxchg(&epoch_timer_on, 1, 0) == 1)
         hrtimer_cancel(&epoch_timer);
@@ -1001,7 +1041,7 @@ static void __exit scth_exit(void)
     free_hashtable_uid();
     free_hashtable_sys();
 
-    pr_info("scth: unloaded\n");
+    printk("scth: unloaded\n");
 }
 
 module_init(scth_init);

@@ -3,7 +3,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 EVENTS="task-clock,context-switches,minor-faults,major-faults"
-# cycles/instructions spesso sono <not supported> in VM; li lasciamo opzionali:
 EVENTS_HW="cycles,instructions"
 
 N1=1
@@ -18,7 +17,7 @@ need() { command -v "$1" >/dev/null || { echo "Manca $1"; exit 1; }; }
 need perf
 need pidstat
 
-# Setup comune
+# common setup
 ./scripts/setup_test_env.sh >/dev/null
 
 run_one() {
@@ -33,7 +32,7 @@ run_one() {
   sudo ./user/scthctl setmode "$mode"
   sudo ./user/scthctl resetstats
 
-  # avvio N processi
+  # start with N processes
   pids=()
   for i in $(seq 1 "$nprocs"); do
     ./user/tester_getpid >/dev/null &
@@ -42,17 +41,17 @@ run_one() {
 
   sleep 1
 
-  echo "[*] pidstat (CPU%) per ${DUR}s (primo pid=${pids[0]})"
-  # pidstat su un solo pid per semplicità; se vuoi su tutti, si può estendere
+  echo "[*] pidstat (CPU%) for ${DUR}s (first pid=${pids[0]})"
+  # Use `pidstat` on a single PID for simplicity; if you want to use it on all of them, it can be extended
   pidstat -p "${pids[0]}" 1 "$DUR" | tee "$OUTDIR/pidstat_mode${mode}_N${nprocs}.txt" || true
 
-  echo "[*] perf stat software events (${DUR}s) (primo pid=${pids[0]})"
+  echo "[*] perf stat software events (${DUR}s) (first pid=${pids[0]})"
   sudo perf stat -e "$EVENTS" -p "${pids[0]}" sleep "$DUR" 2>&1 | tee "$OUTDIR/perf_mode${mode}_N${nprocs}.txt" || true
 
-  echo "[*] perf stat HW (cycles,instructions) (se supportato)"
+  echo "[*] perf stat HW (cycles,instructions) (if supported)"
   sudo perf stat -e "$EVENTS_HW" -p "${pids[0]}" sleep "$DUR" 2>&1 | tee "$OUTDIR/perf_hw_mode${mode}_N${nprocs}.txt" || true
 
-  echo "[*] stats (modulo):"
+  echo "[*] stats (module):"
   ./user/scthctl stats | tee "$OUTDIR/scth_stats_mode${mode}_N${nprocs}.txt"
 
   # cleanup
@@ -70,4 +69,4 @@ for mode in 0 1 2; do
 done
 
 echo
-echo "[*] Salvati risultati in: $OUTDIR"
+echo "[*] saved results in: $OUTDIR"

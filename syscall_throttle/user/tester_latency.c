@@ -28,7 +28,6 @@ int main(int argc, char** argv){
   }
 
   double avg = (n ? (double)sum/n : 0.0);
-  printf("calls=%llu avg_ns=%.1f max_ns=%llu\n",
-         (unsigned long long)n, avg, (unsigned long long)max);
+  printf("calls=%llu avg_ns=%.1f max_ns=%llu\n", (unsigned long long)n, avg, (unsigned long long)max);
   return 0;
 }

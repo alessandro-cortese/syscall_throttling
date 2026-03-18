@@ -56,7 +56,6 @@ start_load() {
     pids+=("$!")
   done
 
-  # IMPORTANT: uno per riga, così "mapfile -t" funziona davvero
   printf "%s\n" "${pids[@]}"
 }
 
@@ -85,7 +84,7 @@ run_one() {
 
   setup_common
 
-  # set mode (kprobe version)
+  # set mode, kprobe version
   sudo "$CTL" setmode "$mode"
 
   sudo "$CTL" on
@@ -110,11 +109,11 @@ run_one() {
 
   if [[ -x "$LAT" ]]; then
     echo "[*] tester_latency ($DUR s) on ONE process (no extra load) ..."
-    # fermiamo il carico e misuriamo "sotto throttling" singolo processo:
+    # let's pause the load and measure single-process ‘under throttling’:
     kill_pids "${pids[@]}"
-    # riavviamo 1 processo latency per $DUR
+    # restart 1 latency process for $DUR
     "$LAT" "$DUR" | tee "$out/latency.txt" || true
-    # riavvio carico per uniformità (non strettamente necessario)
+    # Reload for consistency, not strictly necessary
     mapfile -t pids < <(start_load "$n")
     sleep 1
   fi

@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-echo "[*] Reset & config: SOLO UID $(id -u)"
+echo "[*] Reset & config: only UID $(id -u)"
 sudo ./user/scthctl off
 sudo ./user/scthctl resetstats
 sudo ./user/scthctl delprog tester_getpid 2>/dev/null || true
@@ -17,7 +17,7 @@ sudo ./user/scthctl on
 ./user/tester_getpid &
 pid=$!
 sleep 2
-echo "[*] stats (atteso: delay può essere >0, peak_uid=$(id -u))"
+echo "[*] stats (expected: delay can be >0, peak_uid=$(id -u))"
 ./user/scthctl stats
 kill $pid; wait $pid 2>/dev/null || true
 

@@ -3,15 +3,15 @@ set -e
 
 cd "$(dirname "$0")"
 
-# pulizia: spegni monitor e togli UID (se esiste)
+# cleanup: switch off the monitor and remove the UID, if present
 sudo ./scthctl off || true
 sudo ./scthctl deluid "$(id -u)" 2>/dev/null || true
 
-# pulizia: togli e rimetti le entry (idempotente)
+# cleanup: remove and reinsert entries, idempotent
 sudo ./scthctl delprog tester_getpid 2>/dev/null || true
 sudo ./scthctl delsys 39 2>/dev/null || true
 
-# registra SOLO programma e syscall
+# log only the programme and system calls
 sudo ./scthctl addprog tester_getpid
 sudo ./scthctl addsys 39
 
