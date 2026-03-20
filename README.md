@@ -1,6 +1,6 @@
 # Syscall Throttling LKM
 
-![Syscall Throttling](media/image.png)
+![Syscall Throttling](media/title.png)
 
 Questa repository contiene **due implementazioni** di un servizio di *syscall throttling* tramite un **LKM - Linux Kernel Module** utilizzando la stessa interfaccia utente, `/dev/scth` con `ioctl()` tramite `scthctl`, ma con meccanismi di implementativi diversi:
 
