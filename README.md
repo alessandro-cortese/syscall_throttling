@@ -206,7 +206,7 @@ Gli script `corner_cases_*` verificano:
 
 ---
 
-## Appendix — Requisiti software e raccolta risultati 
+## Appendice — Requisiti software e raccolta risultati 
 
 ### Sistema
 - Linux, testato su Ubuntu 24.04 / kernel 6.x, con supporto ai moduli LKM.
