@@ -41,4 +41,4 @@ wait "$p1" "$p2" 2>/dev/null || true
 
 echo "[*] Done."
 
-# to torn on perf: sudo sysctl kernel.perf_event_paranoid=1
+# to turn on perf: sudo sysctl kernel.perf_event_paranoid=1
