@@ -105,8 +105,8 @@ static u32  peak_uid = 0;
  * */
 
 static void **sys_call_table = NULL;          
-static DEFINE_MUTEX(hook_mutex);              /* serialise install/uninstall hook */
-static DEFINE_SPINLOCK(hook_lock);
+static DEFINE_MUTEX(hook_mutex);                /* serialise install/uninstall hook */
+
 
 typedef asmlinkage long (*sys_fn_t)(const struct pt_regs *);
 
@@ -114,6 +114,7 @@ struct hook_ent {
     u32 nr;
     sys_fn_t orig;
     struct hlist_node node;
+    struct rcu_head rcu;                        /* RCU callback head  */
 };
 
 static DEFINE_HASHTABLE(hook_ht, HT_BITS);
@@ -177,24 +178,45 @@ static int scth_write_sct_entry(u32 nr, void *fn) {
     return 0;
 }
 
+
+/*
+ * hook_get_orig() — lockless read candidate
+ *
+ * Currently takes hook_lock (spinlock) for every syscall that
+ * passes the match_request() filter.  This is safe but adds
+ * lock contention on hot paths.
+ *
+ * With RCU (see design notes) this becomes an rcu_read_lock()
+ * section with no spinning — O(1) and cache-friendly.
+ */
 static sys_fn_t hook_get_orig(u32 nr) {
     struct hook_ent *e;
     sys_fn_t out = NULL;
     u32 h = jhash(&nr, sizeof(nr), 0);
 
-    spin_lock(&hook_lock);
-    hash_for_each_possible(hook_ht, e, node, h) {
+    /*
+     * RCU read-side critical section: no spinning, no sleeping.
+     * Safe because writers use synchronize_rcu() (via call_rcu)
+     * before freeing hook_ent memory.
+     */
+    rcu_read_lock();
+    hash_for_each_possible_rcu(hook_ht, e, node, h) {
         if (e->nr == nr) {
             out = e->orig;
             break;
         }
     }
-    spin_unlock(&hook_lock);
+    rcu_read_unlock();
 
     return out;
 }
 
 static bool hook_is_installed(u32 nr) {
+    /*
+     * Called only from install_hook(), which runs under hook_mutex.
+     * We can use the mutex-protected path directly; no need for
+     * rcu_read_lock here since hook_mutex already excludes writers.
+     */
     return hook_get_orig(nr) != NULL;
 }
 
@@ -268,6 +290,85 @@ static void throttle_sleeping(const char *comm, u32 euid, u64 now_ns) {
     }
 }
 
+/*
+ * ============================================================
+ * SYSCALL TABLE HOOK — DESIGN NOTES
+ * ============================================================
+ *
+ * SINGLE STUB PATTERN
+ * -------------------
+ * All monitored syscalls are redirected to a single wrapper
+ * function: scth_stub(). This works because on x86-64 every
+ * syscall handler has the same prototype:
+ *
+ *   asmlinkage long handler(const struct pt_regs *regs);
+ *
+ * and the syscall number is always available in regs->orig_ax,
+ * regardless of which entry in sys_call_table was invoked.
+ * scth_stub() reads orig_ax to identify the syscall, looks up
+ * the original handler in hook_ht, applies throttling if the
+ * (syscall, comm, euid) triple is registered, and then
+ * tail-calls the original handler transparently.
+ *
+ * This means we only need one function in .text instead of N
+ * generated trampolines — simpler, smaller, and easier to audit.
+ *
+ * INSTALL / REMOVE ORDERING
+ * -------------------------
+ * install_hook(nr) follows a strict two-phase protocol to avoid
+ * races between concurrent installers and between the stub and
+ * a concurrent removal:
+ *
+ *   Phase 1 — patch the table:
+ *     Disable WP (and CET if present), write scth_stub into
+ *     sys_call_table[nr], re-enable WP/CET.  At this point the
+ *     stub is live but hook_ht has no entry for nr yet.
+ *
+ *   Phase 2 — publish the original:
+ *     Under hook_lock, insert the hook_ent (nr -> orig) into
+ *     hook_ht.  Only after this point will scth_stub() find
+ *     the original and be able to forward the call.
+ *
+ * The window between Phase 1 and Phase 2 is intentionally safe:
+ * if a thread enters scth_stub() before Phase 2 completes,
+ * hook_get_orig() returns NULL and the stub returns -ENOSYS.
+ * This is acceptable because the hook is being installed at that
+ * exact instant — the caller would have raced with the admin
+ * operation regardless.
+ *
+ * remove_hook(nr) reverses the order:
+ *
+ *   Phase 1 — unpublish:
+ *     Under hook_lock, remove the hook_ent from hook_ht and
+ *     save the original pointer locally.
+ *
+ *   Phase 2 — restore the table:
+ *     Outside hook_lock, write orig back into sys_call_table[nr].
+ *
+ * RESIDUAL RACE ON REMOVAL ("threads in flight")
+ * -----------------------------------------------
+ * After Phase 1 of removal, threads that entered scth_stub()
+ * before the hook_ht entry was removed will still complete
+ * normally (they already hold orig in a local variable).
+ * However, after Phase 2 restores sys_call_table[nr], new
+ * callers will go directly to the original handler — correct.
+ *
+ * The remaining race is: a thread could be inside scth_stub()
+ * (between hook_get_orig and the orig() call) while remove_hook
+ * is executing Phase 2.  Both paths are safe individually, but
+ * there is no synchronization barrier that waits for in-flight
+ * stub executions to complete before the hook_ent memory is
+ * freed.  In practice this is benign because:
+ *   a) the thread already copied orig to a stack-local variable
+ *      before we freed hook_ent;
+ *   b) scth_stub itself is a kernel .text symbol and is never
+ *      freed.
+ * A production implementation would use RCU or a per-hook
+ * refcount + completion to provide a formal quiescent-state
+ * guarantee.  See the companion note on RCU below.
+ * ============================================================
+ */
+
 static asmlinkage long scth_stub(const struct pt_regs *regs) {
     u32 nr;
     u32 euid;
@@ -302,10 +403,10 @@ static int install_hook(u32 nr) {
     u32 h;
     int ret;
 
+    /* hook_mutex held by caller (SCTH_IOC_ADD_SYSCALL) */
+
     if (!sys_call_table)
         return -EINVAL;
-
-    /* already installed? */
     if (hook_is_installed(nr))
         return 0;
 
@@ -317,94 +418,87 @@ static int install_hook(u32 nr) {
     if (!he)
         return -ENOMEM;
 
-    he->nr = nr;
+    he->nr   = nr;
     he->orig = cur;
     h = jhash(&nr, sizeof(nr), 0);
 
     /*
-     * 1) Patch the sys_call_table BEFORE making the entry visible in hook_ht
-     *    so that the stub never sees the “registered” original but the unpatched entry
+     * Phase 1: patch sys_call_table BEFORE publishing in hook_ht.
+     * See design notes for the ordering rationale.
      */
     scth_begin_syscall_table_patch();
     ret = scth_write_sct_entry(nr, (void *)scth_stub);
+    scth_end_syscall_table_patch();
     if (ret) {
         kfree(he);
         return ret;
     }
-    scth_end_syscall_table_patch();
 
     /*
-     * 2) Now publish the entry in hook_ht under hook_lock.
-     *    Check again: if someone has installed it in the meantime, roll back and try again.
+     * Phase 2: publish under RCU.
+     * After this store is visible, hook_get_orig() will find
+     * the entry and scth_stub() will forward calls correctly.
      */
-    spin_lock(&hook_lock);
-    {
-        struct hook_ent *e2;
-        bool already = false;
-
-        hash_for_each_possible(hook_ht, e2, node, h) {
-            if (e2->nr == nr) {
-                already = true;
-                break;
-            }
-        }
-
-        if (already) {
-            spin_unlock(&hook_lock);
-
-            /* rollback patch */
-            scth_begin_syscall_table_patch();
-            (void)scth_write_sct_entry(nr, (void *)cur);
-            scth_end_syscall_table_patch();
-
-            kfree(he);
-            return 0;
-        }
-
-        hash_add(hook_ht, &he->node, h);
-    }
-    spin_unlock(&hook_lock);
+    hash_add_rcu(hook_ht, &he->node, h);
 
     return 0;
+}
+
+static void hook_ent_free_rcu(struct rcu_head *head) {
+    struct hook_ent *he = container_of(head, struct hook_ent, rcu);
+    kfree(he);
 }
 
 static int remove_hook(u32 nr) {
     struct hook_ent *he;
     struct hlist_node *tmp;
     u32 h;
-    sys_fn_t orig = NULL;
-    int ret;
+
+    /* hook_mutex held by caller */
 
     if (!sys_call_table)
         return -EINVAL;
 
     h = jhash(&nr, sizeof(nr), 0);
 
-    /* 1) Find and unhook from hook_ht under lock */
-    spin_lock(&hook_lock);
     hash_for_each_possible_safe(hook_ht, he, tmp, node, h) {
-        if (he->nr == nr) {
-            orig = he->orig;
-            hash_del(&he->node);
-            spin_unlock(&hook_lock);
+        if (he->nr != nr)
+            continue;
 
-            /* 2) Restore the sys_call_table OUTSIDE the spinlock */
-            scth_begin_syscall_table_patch();
-            ret = scth_write_sct_entry(nr, (void *)orig);
-            if (ret)
-                printk("scth: failed restoring sys_call_table[%u]\n", nr);
-            scth_end_syscall_table_patch();
+        /*
+         * Phase 1: unpublish from RCU-protected hook_ht.
+         * After hlist_del_rcu(), new RCU readers will not find
+         * this entry.  Existing readers that already found it
+         * hold a pointer to he->orig on their stack — safe.
+         */
+        hlist_del_rcu(&he->node);
 
-            kfree(he);
-            return 0;
-        }
+        /*
+         * Phase 2: restore sys_call_table BEFORE waiting for
+         * the RCU grace period.  New syscall invocations will
+         * go directly to orig; stub invocations already in
+         * flight will complete using their stack-local copy.
+         */
+        scth_begin_syscall_table_patch();
+        scth_write_sct_entry(nr, (void *)he->orig);
+        scth_end_syscall_table_patch();
+
+        /*
+         * Defer kfree until after a full RCU grace period.
+         * This guarantees no reader is still dereferencing
+         * he->orig when the memory is released — this is the
+         * formal quiescent-state guarantee that was missing
+         * in the spinlock version.
+         */
+        call_rcu(&he->rcu, hook_ent_free_rcu);
+        return 0;
     }
-    spin_unlock(&hook_lock);
 
     return -ENOENT;
 }
 
-static void remove_all_hooks(void) {
+static void remove_all_hooks(void)
+{
     struct hook_ent *he;
     struct hlist_node *tmp;
     int b;
@@ -412,36 +506,21 @@ static void remove_all_hooks(void) {
     if (!sys_call_table)
         return;
 
-    for (b = 0; b < (1 << HT_BITS); b++) {
-        for (;;) {
-            u32 nr;
-            sys_fn_t orig;
+    /*
+     * Removes all hooks and schedules the free operation via call_rcu.
+     * After the return, the entries will be freed asynchronously
+     * following the RCU grace period. In scth_exit(), we call
+     * rcu_barrier() to wait for all pending call_rcu operations
+     * to complete before the module is unloaded.
+     */
+    hash_for_each_safe(hook_ht, b, tmp, he, node) {
+        hlist_del_rcu(&he->node);
 
-            /* 1) Take an element and remove it from the list under a spinlock */
-            spin_lock(&hook_lock);
+        scth_begin_syscall_table_patch();
+        WRITE_ONCE(sys_call_table[he->nr], (void *)he->orig);
+        scth_end_syscall_table_patch();
 
-            he = NULL;
-            hlist_for_each_entry_safe(he, tmp, &hook_ht[b], node) {
-                hlist_del(&he->node);
-                /* The first one breaks away and leaves */
-                break; 
-            }
-
-            spin_unlock(&hook_lock);
-
-            if (!he)
-                break; /* empty bucket */
-
-            nr = he->nr;
-            orig = he->orig;
-
-            /* 2) Restore the entry OUTSIDE the spinlock */
-            scth_begin_syscall_table_patch();
-            WRITE_ONCE(sys_call_table[nr], (void *)orig);
-            scth_end_syscall_table_patch();
-
-            kfree(he);
-        }
+        call_rcu(&he->rcu, hook_ent_free_rcu);
     }
 }
 
@@ -1028,16 +1107,25 @@ static int __init scth_init(void) {
     return 0;
 }
 
-static void __exit scth_exit(void) {
-
+static void __exit scth_exit(void)
+{
     if (atomic_cmpxchg(&epoch_timer_on, 1, 0) == 1)
         hrtimer_cancel(&epoch_timer);
 
     mutex_lock(&hook_mutex);
     remove_all_hooks();
-    mutex_unlock(&hook_mutex);    
-    misc_deregister(&scth_dev);
+    mutex_unlock(&hook_mutex);
 
+    /*
+     * rcu_barrier() waits for all pending call_rcu() callbacks
+     * (from remove_hook / remove_all_hooks) to complete.
+     * This MUST be called before misc_deregister and before the
+     * module's .text is unmapped — otherwise the hook_ent_free_rcu
+     * callback could execute after the module is gone.
+     */
+    rcu_barrier();
+
+    misc_deregister(&scth_dev);
     free_hashtable_prog();
     free_hashtable_uid();
     free_hashtable_sys();

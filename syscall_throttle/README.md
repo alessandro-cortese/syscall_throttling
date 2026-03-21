@@ -1,118 +1,109 @@
 # `syscall_throttle/` — KPROBE implementation
 
-Questa directory contiene il modulo di throttling basato su **kprobe** installando un'apposita probe sulla funzione di sistema `x64_sys_call` evitando modifiche alla `sys_call_table`.
+Questa directory contiene il modulo di throttling basato su **kprobe** installando un'apposita probe sulla funzione `x64_sys_call`, evitando modifiche alla `sys_call_table`.
 Il modulo è `kernel/scth_mod.c` e si configura via `/dev/scth` + `user/scthctl`.
 
 ---
 
-## 1. Flusso logico 
+## 1. Flusso logico
 
 1. Tramite il programma utente si registra:
-   - **syscall**, il numero, con `addsys <nr>`;
+   - **syscall**, numero, con `addsys <nr>`;
    - filtro **program**, `comm`, e/o **UID**;
    - `MAX_PER_SEC`, budget per epoca da 1 secondo;
-2. La kprobe intercetta la syscall e:
-   - verifica `match_request(nr, comm, euid)`
-   - applica la policy di throttling dipendente dalla modalità selezionata impostata dal parametro `MODE`.
+2. La kprobe intercetta ogni invocazione di `x64_sys_call` e:
+   - verifica `match_request(nr, comm, euid)`;
+   - applica la policy di throttling dipendente dalla modalità selezionata.
 
-Nel path di intercettazione, handler kprobe, la logica è:
+Nel path di intercettazione, ovvero l'handler kprobe, la logica è:
 
-1. early-exit se `monitor_off`
-2. match:
-   - syscall registrata?
-   - comm registrato **oppure** uid registrato?
-3. throttling:
-   - se budget disponibile: consuma token e ritorna
-   - se budget esaurito: attesa fino a epoca successiva che varia in base al mode
+1. early-exit se `monitor_off`;
+2. match: syscall registrata? **E** (comm registrato **O** uid registrato)?
+3. throttling: se budget disponibile, consuma un token e ritorna; se budget esaurito, attesa fino all'epoca successiva dove il tipo della stessa attesa dipende dalla modalità selezionata.
+
+### Nota sul recupero del numero di syscall
+
+A differenza della versione usctm dove `regs->orig_ax` è sempre affidabile, qui la probe si aggancia su `x64_sys_call` e il numero di syscall viene letto da `regs->si`, secondo argomento per ABI interna, con fallback su `regs->di->orig_ax` se il valore da `si` appare non plausibile, > 1024. La soglia è euristica e funziona sui kernel testati, ma è più fragile rispetto all'accesso diretto in uno stub.
 
 ### Componenti chiave nel codice
 
-- `match_request(...)`  
-  verifica: syscall ∈ `sys_ht` AND (comm ∈ `prog_ht` OR euid ∈ `uid_ht`);
-
-- `epoch_rollover_*`  
-  gestisce la finestra da 1s: reset contatori + applicazione di `g_max_next → g_max_current`;
-
-- `update_peak_delay(...)`  
-  aggiorna `peak_delay_ns`, `peak_prog`, `peak_uid`, che rappresenta la peggior attesa osservata.
+- `kp_pre_handler` — entry point kprobe; recupera nr/comm/euid, verifica match, chiama `throttle_if_needed`;
+- `match_request` — verifica: `nr ∈ sys_ht` AND (`comm ∈ prog_ht` OR `euid ∈ uid_ht`);
+- `epoch_rollover_*` — gestisce la finestra da 1s: reset contatori + applicazione `g_max_next → g_max_current`;
+- `update_peak_delay` — aggiorna `peak_delay_ns`, `peak_prog`, `peak_uid`.
 
 ---
 
-## 2. Modalità - mode0/mode1/mode2
+## 2. Modalità — mode0/mode1/mode2
 
-
-Il progetto include **3 implementazioni** della callback, selezionabili con `scthctl setmode <0|1|2>`. 
-Lo scopo è mostrare trade-off tra semplicità e overhead.
+L'implementazione include **3 implementazioni** della logica di attesa, selezionabili con `scthctl setmode <0|1|2>`. Lo scopo è mostrare trade-off tra semplicità e overhead, e motivare lo sviluppo della versione sleeping.
 
 ### MODE 0 — baseline: spin / busy-wait
-Implementazione minimale. 
 
-Quando il budget per l’epoca è finito il thread rimane in loop, *busy-wait* finché l’epoca non cambia. Questa è la soluzione più semplice ma si ha un **consumo CPU altissimo** con il rischio di una fase di spin troppo lunga.
+Implementazione minimale. Quando il budget è finito il thread rimane in loop con `cpu_relax()` finché `win_start_ns` non cambia, il che avviene solo al rollover dell'hrtimer. È la soluzione più semplice ma con **consumo CPU altissimo** e rischio di spin prolungati in kernel path.
 
-Si può osservare un utilizzo della CPU altissimo: nei benchmark con l'utilizzo di `pidstat` si nota il valore `%system ~100%`, e con N=8 si saturano più core.
+Nei benchmark con `pidstat` si osserva `%system ~100%`; con N=8 si saturano più core. I context switch sono bassi perché il thread non cede mai volontariamente la CPU.
 
-Si possono riscontrare un numero di context-switch bassi: perché si sta eseguendo in kernel mode senza dormire.
+### MODE 1 — backoff esponenziale
 
----
+Stesso schema di MODE 0, ma l'inner loop di attesa usa un **backoff esponenziale**: inizia con `step=64` iterazioni di `cpu_relax()`, poi raddoppia `step` fino a un massimo di 8192. Riduce la contesa sul bus della cache e il numero di acquisizioni dello spinlock rispetto al baseline, ma rimane CPU-bound se il carico forza il throttling.
 
-### MODE 1 — optimized callback: riduzione overhead nel path
-Riduce operazioni costose dentro la callback della kprobe esegueno meno lookups/branching, ma **resta basata su spin**. Si ha meno overhead per chiamata in alcuni casi ma è ancora una soluzione CPU-bound se il carico forza il throttling.
+Si possono osservare più context switch rispetto a MODE 0 dato che il backoff porta occasionalmente lo scheduler a intervenire ma l'utilizzo della CPU rimane comunque elevato.
 
-Anche un questo caso si nota l'utilizzo molto alto della CPU. Si possono riscontrare anche un numero maggiore di context switch rispetto al caso precedente dato che si cede la CPU. 
+### MODE 2 — atomic tokens
 
----
-### MODE 2 — optimized 
+Introduce un token bucket gestito con `atomic_dec_if_positive(&g_tokens)`:
 
-Concettualmente rimane un busy wait ma vengono applicate ulteriori ottimizzazioni in modo da ridurre l'overhead quando si è in fase di throttling. In questa modalità si cerca di applicare una logica best-effort per minimizzare overhead nel contesto kprobe ma d'altro canto si mantiene busy-wait e quindi rimane meno efficiente della versione sleeping.
+- **fast path**: se ci sono token disponibili, decremento atomico senza acquisire nessun lock, O(1) e cache-friendly;
+- **slow path**: se i token sono esauriti, attesa con backoff su `g_epoch_sec` aggiornato dal timer;
+- i token vengono ricaricati in `epoch_rollover_locked` con `atomic_set(&g_tokens, g_max_current)`.
 
-Anche in questo caso l'utilizzo della CPU rimane elevato, si considera sempre una soluzione in cui i thread non vengono mandati in sleep, ma si possono avere dei piccoli miglioramenti considerando l'overhead per syscall e una contesa interna ridotta.
+Riduce l'overhead sul path "allowed" rispetto a MODE 0/1, nessuno spinlock per i thread che passano, ma rimane busy-wait per i thread bloccati.
 
-> In pratica: se MODE 0/1/2 usano spin, i benchmark mostrano CPU ~100% per processo sotto throttling.
-> È esattamente la motivazione per cui si è poi passati alla versione “sleeping”, ovvero dove si utilizza l'hook della sys_call_table.
---- 
-
-Gli script lanciano tre modalità. La differenza principale è **come si comporta l’attesa** quando il budget è esaurito.
-
-- **mode0**: baseline, attesa più costosa;
-- **mode1**: variante ottimizzata in modo da ridurre l'overhead;
-- **mode2**: variante più ottimizzata tra le kprobe.
-
-### Nota su soft lockup
-In condizioni estreme, ovvero con **MAX** basso e carico elevato, può apparire:
-
-- `watchdog: BUG: soft lockup - CPU#X stuck ...`
-
-Questo è coerente con attesa attiva, spin/yield, in kernel path.
-Non è necessariamente un bug dell’unload, ma un limite intrinseco della strategia.
+> In pratica: MODE 0/1/2 usano tutti spin, i benchmark mostrano CPU ~100% per processo sotto throttling. È esattamente la motivazione per la versione sleeping con hook della `sys_call_table`.
 
 ---
 
-## 3. Riferimenti
+## 3. Nota su soft lockup
+
+In condizioni estreme, **MAX** basso con carico elevato e con molti thread,  può apparire:
+
+```
+watchdog: BUG: soft lockup - CPU#X stuck ...
+```
+
+Questo è coerente con attesa attiva in kernel path e non è un bug del modulo: è un limite intrinseco della strategia busy-wait. La versione `syscall_throttle_usctm/` elimina completamente questo problema usando sleep su wait queue.
+
+---
+
+## 4. Riferimenti al codice
 
 File: `kernel/scth_mod.c`.
-### 3.1 Config / stato monitor
-- `g_monitor_on`;
-- `g_max_current`, `g_max_next`;
-- `win_count`.
 
-### 3.2 Filtri utilizza della hash set
-- `prog_ht`, comm;
-- `uid_ht`, euid;
-- `sys_ht`, nr syscall.
+### 4.1 Config / stato monitor
 
-### 3.3 Statistiche
-- `blocked_now`, `peak_blocked`, `sum_blocked`, `n_windows`
-- `peak_delay_ns`, `peak_prog`, `peak_uid`
+- `g_monitor_on`, `g_max_current`, `g_max_next`, `win_count`;
+- `epoch_timer`: hrtimer, 1s wall-clock, indipendente dal traffico.
 
-### 3.4 Epoch rollover - 1s
-- campiona i threads che sono stati bloccati;
-- applica l'applicazione del velore di  **MAX** per la prossima epoca;
-- resetta contatori della finestra;
-- rilascia eventuali attese in base alla modalità scelta.
+### 4.2 Filtri — hash set
+
+- `prog_ht` (comm), `uid_ht` (euid), `sys_ht` (nr syscall).
+
+### 4.3 Statistiche
+
+- `blocked_now`, `peak_blocked`, `sum_blocked`, `n_windows`;
+- `peak_delay_ns`, `peak_prog`, `peak_uid`.
+
+### 4.4 Epoch rollover — 1s
+
+1. Campionamento thread bloccati: `sample_window_stats_locked`;
+2. Applicazione deferred MAX: `apply_deferred_max_locked`;
+3. Reset contatori finestra: `win_start_ns`, `win_count`;
+4. Reset token bucket per MODE 2: `atomic_set(&g_tokens, g_max_current)`.
 
 ---
 
-## 4. Build & run
+## 5. Build & run
 
 ```bash
 cd syscall_throttle/kernel
@@ -139,12 +130,15 @@ Corner cases:
 
 ---
 
-## 5. Trade-off
+## 6. Trade-off
 
-**Pro**
-- intercettazione “standard” tramite tracing/kprobe;
-- install/uninstall semplice.
+**Pro:**
+- intercettazione tramite tracing/kprobe, nessuna modifica alla `sys_call_table`;
+- install/uninstall semplice, nessuna patch di memoria kernel;
+- tre modalità esplicitano i trade-off busy-wait vs overhead per confronto.
 
-**Contro**
-- overhead più alto;
-- attesa attiva può consumare molta CPU.
+**Contro:**
+- overhead per chiamata più alto, trap + handler kprobe su ogni `x64_sys_call`;
+- recupero del numero di syscall da `regs->si` è euristico e dipende dall'ABI interna del kernel;
+- attesa attiva consuma molta CPU e può causare soft-lockup;
+- non adatto per syscall bloccanti ad alto volume: i thread in spin potrebbero impedire ad altri thread di ottenere la CPU.
