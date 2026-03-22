@@ -566,7 +566,7 @@ static bool sys_is_registered(u32 nr) {
     return false;
 }
 
-/* root-only update :contentReference[oaicite:3]{index=3} */
+/* root-only update */
 static bool caller_is_root(void) {
     return (from_kuid(&init_user_ns, current_euid()) == 0);
 }
@@ -991,7 +991,7 @@ static const struct file_operations scth_fops = {
 #endif
 };
 
-/* open to all; but updates are restricted to root users: contentReference[oaicite:7]{index=7} */
+/* open to all; but updates are restricted to root users */
 static struct miscdevice scth_dev = {
     .minor = MISC_DYNAMIC_MINOR,
     .name  = "scth",
