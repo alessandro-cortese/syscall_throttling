@@ -174,8 +174,7 @@ static void update_peak_delay(const char *comm, u32 euid, u64 delay_ns) {
     spin_unlock_irqrestore(&cfg_lock, flags);
 }
 
-static inline void apply_deferred_max_locked(void)
-{
+static inline void apply_deferred_max_locked(void) {
 
     /*Last update wins because g_max_next is overwritten; 
     deferred because only copied at each epoch boundary*/
@@ -186,8 +185,7 @@ static inline void apply_deferred_max_locked(void)
 }
 
 /* rollover era: call only under cfg_lock */
-static void epoch_rollover_locked(u64 now_ns)
-{
+static void epoch_rollover_locked(u64 now_ns) {
     /* window statistics */
     sample_window_stats_locked();
 

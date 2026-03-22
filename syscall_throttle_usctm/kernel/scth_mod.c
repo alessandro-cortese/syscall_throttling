@@ -497,8 +497,7 @@ static int remove_hook(u32 nr) {
     return -ENOENT;
 }
 
-static void remove_all_hooks(void)
-{
+static void remove_all_hooks(void) {
     struct hook_ent *he;
     struct hlist_node *tmp;
     int b;
